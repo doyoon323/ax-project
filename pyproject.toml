@@ -1,0 +1,33 @@
+[project]
+name = "ax-project"
+version = "0.1.0"
+description = "Agentic AI implementation project"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=0.3.0",
+    "python-dotenv>=1.0.0",
+    "litellm>=1.40",
+    "pydantic>=2.0",
+    "chromadb>=0.5",
+    "numpy>=1.26",
+    "rank-bm25>=0.2.2",
+    "langgraph>=0.2",
+    "fastapi>=0.110",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
