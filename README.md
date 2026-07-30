@@ -56,9 +56,76 @@
 Python AST로 함수 정의와 함수 호출 관계를 추출하고 SQLite에 저장합니다. Git diff의 변경 라인과 함수 위치를 비교해 변경된 함수를 찾은 뒤, 호출 관계를 역방향으로 탐색하여 영향 함수와 관련 테스트를 찾습니다.
 
 - 일반 코드: Git·AST 분석, 관계 검색, 라인 근거 발급
-- AI Agent: 질문에 필요한 분석 Tool 선택, 결과 검증, 보고서 작성
+- Gemini: 자연어 질문에서 Git ref와 요청 범위를 구조화하고, 검증된 근거를 요약
+- LangGraph Agent: Gemini의 해석에 따라 Tool을 선택하고 전체 분석 흐름을 제어
 
-LLM은 함수 관계를 추측하지 않고 분석 Tool이 반환한 결과와 근거만 사용합니다.
+Gemini는 함수 관계를 계산하지 않습니다. 영향 함수와 테스트는 AST·Git·SQLite Tool이
+결정하며, Gemini가 보고서에서 인용할 수 있는 근거 ID도 Tool이 발급한 값으로 제한합니다.
+
+구현 코드도 두 역할로 구분합니다.
+
+```text
+src/code_impact/db_builder/   소스코드 관계 DB 구축
+src/code_impact/agent/        DB 조회와 영향 보고서 생성
+```
+
+## 현재 Demo
+
+`av-sim` 샘플 저장소에는 인식, 경로 계획, 판단, 제어와 안전 검증 코드가 포함됩니다. Demo 생성 명령은 다음 세 Git 시점을 만듭니다.
+
+- `demo-baseline`: 최초 코드
+- `demo-safety-change`: 안전거리 계산 함수 변경
+- `demo-docs-only`: 문서만 변경한 반례
+
+Demo 파일은 역할에 따라 구분됩니다.
+
+```text
+demo/av-sim/                 Git에 포함되는 샘플 원본
+demo/work/av-sim/            실행 시 생성되는 분석 대상 Git 저장소
+demo/data/code-impact.db     실행 시 생성되는 관계 DB
+```
+
+`demo/work/`와 `demo/data/`는 실행 결과이므로 Git에 포함하지 않습니다.
+
+Dev Container에서 다음과 같이 실행합니다.
+
+```bash
+uv sync
+uv run code-impact setup-demo
+uv run code-impact analyze \
+  "demo-safety-change 커밋의 영향 범위와 테스트를 알려줘."
+```
+
+실행 전 프로젝트 루트의 `.env`에 Gemini API 키를 설정합니다. `.env`는 Git에서 제외됩니다.
+
+```dotenv
+GEMINI_API_KEY=발급받은_API_키
+# 선택 사항
+GEMINI_MODEL=gemini-3.6-flash
+```
+
+Agent는 질문 하나를 받아 Gemini가 요청 범위를 해석한 뒤 필요한 Tool만 실행합니다.
+
+```text
+자연어 질문
+  → Gemini가 Git ref·요청 범위 구조화
+  → 변경 함수 조회
+  → 필요한 경우 최대 2단계 호출자·관련 테스트 조회
+  → 파일·라인 근거 검증
+  → Gemini가 검증된 근거 ID로 요약
+  → 변경 영향 보고서
+```
+
+문서 변경 반례도 확인할 수 있습니다.
+
+```bash
+uv run code-impact analyze \
+  "demo-docs-only 커밋의 영향 범위와 테스트를 알려줘."
+```
+
+현재 Demo는 Gemini의 구조화 응답으로 질문을 해석합니다. 예를 들어 “변경 함수만 알려줘”라고
+질문하면 호출자와 테스트 Tool을 생략하고, “영향 범위와 테스트를 알려줘”라고 질문하면 두
+Tool을 모두 실행합니다.
 
 ## 3주 최종 목표
 
@@ -73,7 +140,7 @@ LLM은 함수 관계를 추측하지 않고 분석 Tool이 반환한 결과와 �
 ## 구현 범위
 
 - Python 샘플 저장소 1개
-- 인증·주문·결제로 구성된 소규모 코드
+- 인식·경로 계획·판단·제어로 구성된 `av-sim` 코드
 - 평가용 변경 커밋 12~15개
 - 함수 호출 관계 최대 2단계
 - 커밋 ID 기반 변경 영향 분석
@@ -92,9 +159,5 @@ LLM은 함수 관계를 추측하지 않고 분석 Tool이 반환한 결과와 �
 
 평가용 커밋마다 변경 함수, 영향 함수와 관련 테스트의 정답을 미리 작성하고 Agent 결과와 비교합니다.
 
-- 변경 함수 탐지율
-- 영향 함수 Recall
-- 관련 테스트 Recall
-- 파일·함수·라인 근거 유효성
 
 테스트 실행 Trace는 어떤 테스트가 실제로 관련 함수를 실행했는지 확인하는 보조 근거로 사용합니다.
