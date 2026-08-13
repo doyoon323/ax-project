@@ -113,6 +113,9 @@ capability 제거, read-only root, CPU·메모리·PID 제한을 사용하며 AP
 있고 작성자 관계가 `OWNER`, `MEMBER`, `COLLABORATOR`인 Issue만 한 번씩 큐에 넣습니다.
 Patch 단계에서 실제 파일 변경이 없으면 성공으로 보고하지 않고 사람 검토가 필요한 실패로 종료합니다.
 따라서 모델의 설명만으로 `no-change` 완료나 Draft PR 생략을 정당화할 수 없습니다.
+신규 공개 API의 테스트가 기준 코드에서 import 오류를 내면 해당 테스트만 한 번 보정해, 기준
+코드에서는 assertion 실패하고 수정 코드에서는 통과하도록 검증합니다. 기준 코드에서도 테스트가
+통과하면 요구사항을 증명하지 못한 것으로 종료하며, GitHub 상태에 구체적인 원인을 표시합니다.
 기본 모델은 코드 수정 품질을 우선한 유료 Gemini 3.1 Pro Preview입니다. 현재 기본 비용 계산은
 2026-08-13 기준 [공식 Standard 단가](https://ai.google.dev/gemini-api/docs/pricing)의 입력 $2/백만,
 출력 $12/백만(요청 20만 토큰 이하)을 사용합니다. 사용 모델과 공급자가

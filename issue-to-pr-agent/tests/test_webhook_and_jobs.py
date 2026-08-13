@@ -19,7 +19,7 @@ from issue_to_pr_agent.github_client import GitHubClient, GitHubPublishError
 from issue_to_pr_agent.jobs import JobStore
 from issue_to_pr_agent.main import create_app, extract_issue_task, verify_webhook_signature
 from issue_to_pr_agent.models import AgentRunResult, CommandResult, IssueTask
-from issue_to_pr_agent.worker import JobWorker
+from issue_to_pr_agent.worker import JobProcessError, JobWorker
 
 
 def mark_running_until_killed(db_path: str, issue: IssueTask, ready: Any) -> None:
@@ -290,6 +290,7 @@ def test_worker_retries_and_persists_attempt_count(tmp_path: Path) -> None:
 def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     attempts_path = tmp_path / "attempts.txt"
+    status_updates: list[tuple[str, int, int, str]] = []
 
     def invalid_job(_: IssueTask) -> dict:
         attempts_path.write_text("attempted", encoding="utf-8")
@@ -304,7 +305,15 @@ def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
         author="octocat",
         author_association="OWNER",
     )
-    worker = JobWorker(store, invalid_job, max_attempts=3, retry_delay_seconds=0)
+    worker = JobWorker(
+        store,
+        invalid_job,
+        max_attempts=3,
+        retry_delay_seconds=0,
+        status_callback=lambda _, status, attempt, maximum, detail: status_updates.append(
+            (status, attempt, maximum, detail)
+        ),
+    )
 
     async def exercise_worker() -> None:
         await worker.start()
@@ -316,6 +325,22 @@ def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
 
     assert attempts_path.read_text(encoding="utf-8") == "attempted"
     assert store.status(issue.delivery_id) == "failed"
+    assert status_updates[-1][:3] == ("failed", 1, 1)
+    assert "자동 재시도하지 않습니다" in status_updates[-1][3]
+
+
+def test_worker_explains_unproven_fail_to_pass() -> None:
+    worker = JobWorker(JobStore(Path("unused.sqlite3")), lambda _: {})
+    error = JobProcessError(
+        "AgentExecutionError",
+        "fail-to-pass proof failed: edited tests also pass against the base commit",
+    )
+
+    detail = worker._failure_detail(error, attempt=1)
+
+    assert "수정 전 코드에서도 통과" in detail
+    assert "기대 동작과 인수 조건" in detail
+    assert "복잡도" not in detail
 
 
 def test_worker_hard_timeout_kills_isolated_process(tmp_path: Path) -> None:

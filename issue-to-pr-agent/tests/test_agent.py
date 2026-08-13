@@ -531,3 +531,107 @@ def test_fail_to_pass_rejects_test_that_already_passes_on_base(tmp_path: Path) -
             completion_fn=lambda **_: next(replies),
             sleep_fn=lambda _: None,
         ).run(issue, WorkspaceTools(tmp_path))
+
+
+def test_fail_to_pass_import_error_gets_one_baseline_safe_correction(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "sample.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    replies = iter(
+        [
+            response({"phase": "diagnose", "note": "inspect", "commands": []}),
+            response(
+                {
+                    "phase": "patch",
+                    "note": "add widget with a direct-import test",
+                    "edits": [
+                        {
+                            "path": "sample.py",
+                            "search": "VALUE = 1\n",
+                            "replace": ("VALUE = 1\n\nclass Widget:\n    value = 2\n"),
+                        },
+                        {
+                            "mode": "create",
+                            "path": "tests/test_widget.py",
+                            "search": "",
+                            "replace": (
+                                "import unittest\n"
+                                "from sample import Widget\n\n"
+                                "class WidgetTest(unittest.TestCase):\n"
+                                "    def test_value(self):\n"
+                                "        self.assertEqual(Widget().value, 2)\n"
+                            ),
+                        },
+                    ],
+                    "commands": [],
+                }
+            ),
+            response(
+                {
+                    "phase": "verify",
+                    "note": "verify",
+                    "commands": [],
+                    "finish": True,
+                    "summary": "added widget",
+                }
+            ),
+            response(
+                {
+                    "phase": "patch",
+                    "note": "make the new-symbol test baseline safe",
+                    "edits": [
+                        {
+                            "path": "tests/test_widget.py",
+                            "search": "from sample import Widget\n",
+                            "replace": "import sample\n",
+                        },
+                        {
+                            "path": "tests/test_widget.py",
+                            "search": "        self.assertEqual(Widget().value, 2)\n",
+                            "replace": (
+                                "        self.assertTrue(hasattr(sample, 'Widget'))\n"
+                                "        widget = getattr(sample, 'Widget')\n"
+                                "        self.assertEqual(widget().value, 2)\n"
+                            ),
+                        },
+                    ],
+                    "commands": [],
+                }
+            ),
+            response(
+                {
+                    "phase": "verify",
+                    "note": "verify corrected test",
+                    "commands": [],
+                    "finish": True,
+                    "summary": "added widget with baseline-safe regression test",
+                }
+            ),
+        ]
+    )
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=11,
+        title="Add Widget",
+        body="Add a Widget class whose value is two.",
+        author="octocat",
+        author_association="OWNER",
+    )
+    settings = make_settings(tmp_path).model_copy(update={"require_fail_to_pass": True})
+
+    result = IssueFixAgent(
+        settings,
+        completion_fn=lambda **_: next(replies),
+        sleep_fn=lambda _: None,
+    ).run(issue, WorkspaceTools(tmp_path))
+
+    assert result.correction_cycles == 1
+    assert result.baseline_verification_results
+    assert all(not item.succeeded for item in result.baseline_verification_results)
+    assert all(item.succeeded for item in result.verification_results)

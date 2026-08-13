@@ -146,7 +146,8 @@ class JobWorker:
                 error = f"{type(exc).__name__}: {exc}"
                 attempt = self.store.attempt_count(delivery_id)
                 issue = self.store.get_issue(delivery_id)
-                if attempt < self.max_attempts and self._is_retryable(exc):
+                retryable = self._is_retryable(exc)
+                if attempt < self.max_attempts and retryable:
                     self.store.mark_retry_queued(delivery_id, error)
                     await self._notify(
                         issue,
@@ -169,12 +170,21 @@ class JobWorker:
                         "failed",
                         attempt,
                         self._failure_detail(exc, attempt),
+                        max_attempts=self.max_attempts if retryable else attempt,
                     )
                     logger.exception("Issue-to-PR job failed for delivery %s", delivery_id)
             finally:
                 self.queue.task_done()
 
-    async def _notify(self, issue: IssueTask, status: str, attempt: int, detail: str) -> None:
+    async def _notify(
+        self,
+        issue: IssueTask,
+        status: str,
+        attempt: int,
+        detail: str,
+        *,
+        max_attempts: int | None = None,
+    ) -> None:
         if self.status_callback is None:
             return
         try:
@@ -183,7 +193,7 @@ class JobWorker:
                 issue,
                 status,
                 attempt,
-                self.max_attempts,
+                self.max_attempts if max_attempts is None else max_attempts,
                 detail,
             )
         except Exception:
@@ -261,17 +271,40 @@ class JobWorker:
 
     def _failure_detail(self, exc: Exception, attempt: int) -> str:
         name = str(getattr(exc, "remote_type", type(exc).__name__))
-        if "Timeout" in name:
+        message = str(exc).casefold()
+        if "edited tests also pass against the base commit" in message:
+            reason = (
+                "추가한 테스트가 수정 전 코드에서도 통과해 Issue의 요구사항을 "
+                "증명하지 못했습니다. 기대 동작과 인수 조건을 구체적으로 작성해 주세요."
+            )
+        elif "baseline test failed because of an import" in message:
+            reason = (
+                "수정 전 코드에서 테스트를 정상적으로 불러오지 못해 안전한 "
+                "fail-to-pass 증거를 만들지 못했습니다."
+            )
+        elif "patch produced no effective file changes" in message:
+            reason = "실제 코드 변경을 만들지 못해 자동 게시를 중단했습니다."
+        elif "verification failed" in message:
+            reason = "수정 코드가 필수 테스트를 통과하지 못해 자동 게시를 중단했습니다."
+        elif "Timeout" in name:
             reason = "실행 시간 한도를 초과해 중단했습니다."
         elif "Budget" in name:
             reason = "토큰 또는 비용 한도를 초과해 중단했습니다."
-        elif "Complexity" in name or "AgentExecution" in name:
-            reason = "복잡도 또는 검증 기준을 충족하지 못해 사람 검토로 전환했습니다."
+        elif "complexity limit exceeded" in message or "Complexity" in name:
+            reason = "자동 수정 범위를 초과해 사람 검토로 전환했습니다."
+        elif "AgentExecution" in name:
+            reason = "안전한 자동 검증 기준을 충족하지 못해 게시를 중단했습니다."
         else:
             reason = "안전하게 자동 처리할 수 없는 오류로 중단했습니다."
-        retry = (
-            " 자동 재시도 한도를 소진했습니다."
-            if attempt >= self.max_attempts
-            else " Issue를 보완하면 새 revision으로 다시 접수할 수 있습니다."
-        )
+        if self._is_retryable(exc):
+            retry = (
+                " 자동 재시도 한도를 소진했습니다."
+                if attempt >= self.max_attempts
+                else " 일시 오류이므로 자동 재시도할 수 있습니다."
+            )
+        else:
+            retry = (
+                " 이 오류는 자동 재시도하지 않습니다. Issue를 수정하면 새 revision으로 "
+                "다시 접수됩니다."
+            )
         return f"{reason}{retry} 오류 분류: {name}."

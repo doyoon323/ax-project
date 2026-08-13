@@ -29,6 +29,14 @@ class ComplexityLimitError(RuntimeError):
     """Raised when an issue exceeds the bounded automatic-change policy."""
 
 
+class BaselineTestError(ComplexityLimitError):
+    """Raised when a baseline test failure is not valid fail-to-pass evidence."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 _READ_COMMANDS = {"head", "ls", "rg", "sed", "tail"}
 _GIT_READ_SUBCOMMANDS = {"diff", "grep", "log", "ls-files", "show", "status"}
 _VERIFY_COMMANDS = {"pytest", "ruff"}
@@ -341,8 +349,10 @@ class WorkspaceTools:
         if result.succeeded:
             return
         if result.timed_out or result.return_code != 1:
-            raise ComplexityLimitError(
-                "baseline test failed because of timeout, collection, configuration, or usage error"
+            raise BaselineTestError(
+                "baseline test failed because of timeout, collection, configuration, or "
+                "usage error",
+                reason="infrastructure",
             )
 
         output = result.output.casefold()
@@ -358,8 +368,9 @@ class WorkspaceTools:
             "internal error",
         )
         if any(marker in output for marker in infrastructure_markers):
-            raise ComplexityLimitError(
-                "baseline test failed because of an import, collection, or configuration error"
+            raise BaselineTestError(
+                "baseline test failed because of an import, collection, or configuration error",
+                reason="import_or_collection",
             )
 
         executable = Path(command[0]).name
@@ -367,8 +378,9 @@ class WorkspaceTools:
             executable in {"python", "python3"} and command[1:3] == ["-m", "unittest"]
         ) or (executable == "uv" and command[1:5] == ["run", "python", "-m", "unittest"])
         if is_unittest and "fail:" not in output and "assertionerror" not in output:
-            raise ComplexityLimitError(
-                "baseline unittest failure was not an assertion failure in the targeted test"
+            raise BaselineTestError(
+                "baseline unittest failure was not an assertion failure in the targeted test",
+                reason="non_assertion",
             )
 
     @staticmethod
