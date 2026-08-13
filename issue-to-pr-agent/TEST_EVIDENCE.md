@@ -15,6 +15,7 @@ GitHub App: auto-coding-issues[bot] identity, target repository, required permis
 Agent container: read-only PEM mount and GitHub App authentication passed
 Git HTTPS: short-lived installation token + GIT_ASKPASS ls-remote passed
 Runner runtime: healthy, network=none, rootfs=read-only, cap-drop=ALL
+Poll acceptance: Issue #7 automatic detection, three retries, final failure comment passed
 ```
 
 재현 명령:
@@ -81,6 +82,10 @@ docker compose build
 
 따라서 현재 표현은 **"제어·지역화·격리·로컬 복구는 검증했지만 외부 E2E와 해결 정확도는
 아직 별도 acceptance 검증이 필요하다"**가 정확하다.
+
+2026-08-14 Issue #7로 Poll 기반 외부 acceptance를 시작해 자동 감지와 GitHub 상태 댓글은
+검증했다. Gemini와 Groq가 모두 429를 반환해 3회 재시도 후 실패했으므로 코드 수정·push·Check·Draft
+PR 구간은 아직 검증되지 않았다.
 
 참고로 2026-08-13 `ax-test-repo`의 `main` Branch Protection API를 읽기 전용으로 조회했으나,
 비공개 저장소의 GitHub 플랜 제한으로 HTTP 403이 반환되어 설정 유무를 확정하지 못했다.

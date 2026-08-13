@@ -89,7 +89,9 @@ App 모드의 Git fetch/push는 HTTPS와 단기 설치 토큰을 사용하며 �
 
 ## 실행: Docker Compose
 
-`.env`의 `WORKSPACE_PATH`와 `GITHUB_APP_PRIVATE_KEY_PATH`를 호스트 절대경로로 둔 뒤 실행합니다.
+`.env`의 `WORKSPACE_PATH`, `GITHUB_APP_PRIVATE_KEY_PATH`, `ISSUE_TO_PR_RUNTIME_PATH`를 호스트
+절대경로로 둔 뒤 실행합니다. 마지막 경로에는 mirror, Worktree, Runner queue, SQLite 상태가
+저장되며 저장소와 분리된 전용 디렉터리를 사용합니다.
 
 ```bash
 docker compose up --build

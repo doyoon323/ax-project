@@ -200,6 +200,8 @@ class GitWorkspaceManager:
             completed = subprocess.run(
                 [
                     "git",
+                    "-c",
+                    f"safe.directory={source_root}",
                     "clone",
                     "--no-checkout",
                     "--no-hardlinks",
@@ -249,7 +251,7 @@ class GitWorkspaceManager:
     ) -> str:
         environment = self._git_environment(arguments)
         completed = subprocess.run(
-            ["git", *arguments],
+            ["git", "-c", f"safe.directory={self.repository_root}", *arguments],
             cwd=cwd or self.repository_root,
             capture_output=True,
             text=True,

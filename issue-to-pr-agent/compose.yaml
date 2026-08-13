@@ -7,10 +7,10 @@ services:
       - -c
       - mkdir -p /repository-cache /worktrees /runner-queue/requests /runner-queue/responses /state && chown -R 10001:10001 /repository-cache /worktrees /runner-queue /state
     volumes:
-      - worktrees:/worktrees
-      - runner-queue:/runner-queue
-      - state:/state
-      - repository-cache:/repository-cache
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/worktrees:/worktrees
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/runner-queue:/runner-queue
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/state:/state
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/repository-cache:/repository-cache
     network_mode: none
     restart: "no"
 
@@ -23,8 +23,8 @@ services:
       volume-init:
         condition: service_completed_successfully
     volumes:
-      - worktrees:/worktrees:ro
-      - runner-queue:/runner-queue
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/worktrees:/worktrees:ro
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/runner-queue:/runner-queue
     network_mode: none
     read_only: true
     tmpfs:
@@ -67,10 +67,10 @@ services:
         condition: service_healthy
     volumes:
       - ${WORKSPACE_PATH:?set WORKSPACE_PATH in .env}:/target-repository:ro
-      - repository-cache:/repository-cache
-      - worktrees:/worktrees
-      - runner-queue:/runner-queue
-      - state:/state
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/repository-cache:/repository-cache
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/worktrees:/worktrees
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/runner-queue:/runner-queue
+      - ${ISSUE_TO_PR_RUNTIME_PATH:?set ISSUE_TO_PR_RUNTIME_PATH in .env}/state:/state
       - ${GITHUB_APP_PRIVATE_KEY_PATH:?set GITHUB_APP_PRIVATE_KEY_PATH in .env}:/run/secrets/github-app.pem:ro
     ports:
       - "8000:8000"
@@ -86,9 +86,3 @@ services:
     cpus: 2.0
     restart: unless-stopped
     stop_grace_period: 30s
-
-volumes:
-  worktrees:
-  runner-queue:
-  state:
-  repository-cache:
