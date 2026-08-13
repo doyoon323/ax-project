@@ -49,6 +49,7 @@ services:
       dockerfile: Dockerfile
     user: "10001:10001"
     env_file:
+      - ../.env
       - .env
     environment:
       WORKSPACE_PATH: /target-repository
@@ -57,6 +58,7 @@ services:
       VERIFICATION_RUNNER_QUEUE_PATH: /runner-queue
       STATE_DB_PATH: /state/jobs.sqlite3
       REPOSITORY_MIRROR_PATH: /repository-cache/target
+      GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
       PUBLISH_ENABLED: ${CONTAINER_PUBLISH_ENABLED:-false}
     depends_on:
       volume-init:
@@ -69,6 +71,7 @@ services:
       - worktrees:/worktrees
       - runner-queue:/runner-queue
       - state:/state
+      - ${GITHUB_APP_PRIVATE_KEY_PATH:?set GITHUB_APP_PRIVATE_KEY_PATH in .env}:/run/secrets/github-app.pem:ro
     ports:
       - "8000:8000"
     read_only: true

@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     github_webhook_secret: SecretStr = SecretStr("")
     github_repository: str
     workspace_path: Path
+    github_auth_mode: Literal["token", "app"] = "token"
+    github_app_id: int | None = None
+    github_app_installation_id: int | None = None
+    github_app_slug: str = ""
+    github_app_private_key_path: Path | None = None
 
     issue_source: Literal["webhook", "poll"] = "webhook"
     poll_interval_seconds: float = 15.0
@@ -88,6 +93,13 @@ class Settings(BaseSettings):
         parts = value.split("/")
         if len(parts) != 2 or not all(parts):
             raise ValueError("GITHUB_REPOSITORY must use the owner/repository form")
+        return value
+
+    @field_validator("github_app_id", "github_app_installation_id")
+    @classmethod
+    def validate_github_app_identifiers(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("GitHub App identifiers must be positive integers")
         return value
 
     @field_validator("max_turns")
@@ -229,12 +241,25 @@ class Settings(BaseSettings):
                 raise ValueError("each required verification command must be a non-empty argv list")
         return value
 
-    @field_validator("github_expected_login", "git_author_name", "git_author_email")
+    @field_validator(
+        "github_expected_login",
+        "github_app_slug",
+        "git_author_name",
+        "git_author_email",
+    )
     @classmethod
     def reject_identity_control_characters(cls, value: str) -> str:
         if "\n" in value or "\r" in value or "\x00" in value:
             raise ValueError("identity values cannot contain control characters")
         return value.strip()
+
+    @field_validator("github_app_slug")
+    @classmethod
+    def validate_github_app_slug(cls, value: str) -> str:
+        invalid_character = any(not (char.isalnum() or char == "-") for char in value)
+        if value and (len(value) > 100 or invalid_character):
+            raise ValueError("GITHUB_APP_SLUG must contain only letters, numbers, or hyphens")
+        return value
 
     @field_validator("turn_delay_seconds")
     @classmethod
@@ -264,7 +289,22 @@ class Settings(BaseSettings):
             )
         if self.issue_source == "webhook" and not self.github_webhook_secret.get_secret_value():
             raise ValueError("GITHUB_WEBHOOK_SECRET is required in webhook mode")
-        if self.publish_enabled and not self.github_expected_login:
+        if self.github_auth_mode == "app":
+            if self.github_token.get_secret_value():
+                raise ValueError("GITHUB_TOKEN must be empty when GITHUB_AUTH_MODE=app")
+            if not self.github_app_id or not self.github_app_installation_id:
+                raise ValueError(
+                    "GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID are required in app mode"
+                )
+            if not self.github_app_slug or self.github_app_private_key_path is None:
+                raise ValueError(
+                    "GITHUB_APP_SLUG and GITHUB_APP_PRIVATE_KEY_PATH are required in app mode"
+                )
+        if (
+            self.publish_enabled
+            and self.github_auth_mode == "token"
+            and not self.github_expected_login
+        ):
             raise ValueError("GITHUB_EXPECTED_LOGIN is required when PUBLISH_ENABLED=true")
         if self.verification_backend == "host" and not self.allow_host_verification:
             raise ValueError(

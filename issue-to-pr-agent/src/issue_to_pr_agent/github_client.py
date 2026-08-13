@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from .config import Settings
+from .github_auth import GitHubAppAuthenticator, GitHubAppAuthError
 from .models import AgentRunResult, IssueTask
 
 
@@ -50,8 +52,20 @@ class PublishResult:
 class GitWorkspaceManager:
     """Creates and cleans an isolated worktree without touching the user's checkout."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        authenticator: GitHubAppAuthenticator | None = None,
+    ) -> None:
         self.settings = settings
+        self.app_authenticator = (
+            authenticator
+            if authenticator is not None
+            else GitHubAppAuthenticator(settings)
+            if settings.github_auth_mode == "app"
+            else None
+        )
         source_root = settings.workspace_path.resolve(strict=True)
         self.repository_root = source_root
         self.worktree_root = settings.worktree_root.resolve(strict=False)
@@ -59,7 +73,7 @@ class GitWorkspaceManager:
             self.repository_root
         ):
             raise GitOperationError("WORKTREE_ROOT must be outside the target repository")
-        self._validate_repository()
+        self._validate_repository(require_app_https=settings.repository_mirror_path is None)
         if settings.repository_mirror_path is not None:
             self._prepare_repository_mirror(source_root, settings.repository_mirror_path)
 
@@ -148,7 +162,7 @@ class GitWorkspaceManager:
             self._git(["worktree", "remove", "--force", str(session.path)])
         self._git(["branch", "-D", session.branch], allow_codes={0, 1})
 
-    def _validate_repository(self) -> None:
+    def _validate_repository(self, *, require_app_https: bool = False) -> None:
         root = self._git(["rev-parse", "--show-toplevel"], cwd=self.repository_root)
         if Path(root).resolve() != self.repository_root:
             raise GitOperationError("WORKSPACE_PATH must point to the target repository root")
@@ -159,6 +173,14 @@ class GitWorkspaceManager:
             return
         if not self._matches_github_origin(origin):
             raise GitOperationError("origin remote does not match GITHUB_REPOSITORY")
+        if (
+            require_app_https
+            and self.settings.github_auth_mode == "app"
+            and not origin.startswith("https://")
+        ):
+            raise GitOperationError(
+                "GitHub App Git access requires an HTTPS origin or a repository mirror"
+            )
 
     def _prepare_repository_mirror(self, source_root: Path, raw_mirror_path: Path) -> None:
         mirror_path = raw_mirror_path.resolve(strict=False)
@@ -193,8 +215,11 @@ class GitWorkspaceManager:
                 message = (completed.stderr or completed.stdout).strip()[:500]
                 raise GitOperationError(f"git clone for repository mirror failed: {message}")
         self.repository_root = mirror_path.resolve(strict=True)
-        self._git(["remote", "set-url", "origin", source_origin])
-        self._validate_repository()
+        publish_origin = source_origin
+        if self.settings.github_auth_mode == "app":
+            publish_origin = f"https://github.com/{self.settings.github_repository}.git"
+        self._git(["remote", "set-url", "origin", publish_origin])
+        self._validate_repository(require_app_https=True)
 
     @staticmethod
     def _is_local_origin(origin: str) -> bool:
@@ -222,6 +247,7 @@ class GitWorkspaceManager:
         timeout: int = 60,
         allow_codes: set[int] | None = None,
     ) -> str:
+        environment = self._git_environment(arguments)
         completed = subprocess.run(
             ["git", *arguments],
             cwd=cwd or self.repository_root,
@@ -229,12 +255,39 @@ class GitWorkspaceManager:
             text=True,
             timeout=timeout,
             check=False,
+            env=environment,
         )
         accepted = allow_codes or {0}
         if completed.returncode not in accepted:
             message = (completed.stderr or completed.stdout).strip()[:500]
             raise GitOperationError(f"git {arguments[0]} failed: {message}")
         return completed.stdout.strip()
+
+    def _git_environment(self, arguments: list[str]) -> dict[str, str] | None:
+        if self.settings.github_auth_mode != "app" or arguments[0] not in {
+            "fetch",
+            "ls-remote",
+            "push",
+        }:
+            return None
+        if self.app_authenticator is None:
+            raise GitOperationError("GitHub App authenticator is unavailable")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": str(self._git_askpass_path()),
+                "GITHUB_TOKEN": self.app_authenticator.installation_token(),
+            }
+        )
+        return environment
+
+    @staticmethod
+    def _git_askpass_path() -> Path:
+        installed = Path("/usr/local/bin/git-askpass")
+        if installed.is_file():
+            return installed
+        return Path(__file__).resolve().parents[2] / "docker" / "git-askpass.sh"
 
     @staticmethod
     def _reject_sensitive_path(raw_path: str) -> None:
@@ -256,15 +309,28 @@ class GitWorkspaceManager:
 class GitHubClient:
     """Minimal REST client for Draft PR creation, assignment, and issue comments."""
 
-    def __init__(self, settings: Settings, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        session: requests.Session | None = None,
+        *,
+        authenticator: GitHubAppAuthenticator | None = None,
+    ) -> None:
         self.settings = settings
         self.session = session or requests.Session()
+        self.app_authenticator = (
+            authenticator
+            if authenticator is not None
+            else GitHubAppAuthenticator(settings)
+            if settings.github_auth_mode == "app"
+            else None
+        )
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": settings.github_api_version,
             "User-Agent": "issue-to-pr-agent/0.1",
         }
-        token = self._resolve_token()
+        token = self._resolve_token() if settings.github_auth_mode == "token" else ""
         if token:
             headers["Authorization"] = f"Bearer {token}"
         self.session.headers.update(headers)
@@ -272,6 +338,20 @@ class GitHubClient:
 
     def validate_identity(self) -> str:
         """Fail closed before publication when the token belongs to an unexpected account."""
+
+        if self.settings.github_auth_mode == "app":
+            if self.app_authenticator is None:
+                raise GitHubPublishError("GitHub App authenticator is unavailable")
+            try:
+                login = self.app_authenticator.validate()
+            except GitHubAppAuthError as exc:
+                raise GitHubPublishError(
+                    str(exc),
+                    status_code=exc.status_code,
+                    retryable=exc.retryable,
+                ) from exc
+            self.identity_login = login
+            return login
 
         payload = self._request("GET", "/user", expected={200})
         login = str((payload or {}).get("login") or "")
@@ -460,6 +540,7 @@ class GitHubClient:
         return pulls[0] if pulls else None
 
     def _try_assign(self, pr_number: int, author: str) -> tuple[bool, str]:
+        self._refresh_authorization()
         try:
             check = self.session.get(
                 self._url(f"/repos/{self.settings.github_repository}/assignees/{author}"),
@@ -488,6 +569,7 @@ class GitHubClient:
         expected: set[int],
         **kwargs: Any,
     ) -> Any:
+        self._refresh_authorization()
         try:
             response = self.session.request(method, self._url(path), timeout=30, **kwargs)
         except requests.RequestException as exc:
@@ -526,6 +608,21 @@ class GitHubClient:
         except (FileNotFoundError, subprocess.SubprocessError):
             return ""
         return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    def _refresh_authorization(self) -> None:
+        if self.settings.github_auth_mode != "app":
+            return
+        if self.app_authenticator is None:
+            raise GitHubPublishError("GitHub App authenticator is unavailable")
+        try:
+            token = self.app_authenticator.installation_token()
+        except GitHubAppAuthError as exc:
+            raise GitHubPublishError(
+                str(exc),
+                status_code=exc.status_code,
+                retryable=exc.retryable,
+            ) from exc
+        self.session.headers["Authorization"] = f"Bearer {token}"
 
     def _to_issue_task(self, payload: dict[str, Any]) -> IssueTask | None:
         if "pull_request" in payload:

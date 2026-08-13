@@ -27,7 +27,7 @@ GitHub Issue(opened/labeled 또는 주기 조회)
 - Compose 운영에서는 Agent와 무권한 Runner를 분리합니다. Runner에는 토큰과 네트워크가 없습니다.
 - Runner는 Worktree를 읽기 전용으로 마운트하고 임시 bytecode는 `/tmp`에만 기록합니다.
 - 모델 제안과 별도로 서버가 `git diff --check`와 필수 회귀 테스트를 실행합니다.
-- 게시 전 토큰의 GitHub 로그인과 `GITHUB_EXPECTED_LOGIN`이 일치해야 합니다.
+- 게시 전 GitHub App ID·slug·설치 저장소·필수 권한을 검증합니다.
 - 변경사항, fail-to-pass, 전체 회귀 테스트와 GitHub Check 기록이 모두 성공해야 Draft PR을 만듭니다.
 - Agent 단계 10분·8파일·800줄·3만 토큰·예상 $0.50을 넘으면 사람 검토로 전환합니다.
 
@@ -46,20 +46,25 @@ python3.13 -m venv .venv
 docker pull python:3.13-slim
 ```
 
-현재 로컬 구성은 상위 프로젝트 `.env`의 기존 Gemini·Groq 키를 **프로그램 실행 시에만** 읽고,
-이 서비스의 `.env`에는 저장소 연결 정보만 둡니다. GitHub 토큰을 비워두면 `gh auth token`을
-실행 중에 읽으므로 토큰을 파일이나 로그에 복사하지 않아도 됩니다.
+현재 구성은 상위 프로젝트 `.env`의 기존 Gemini·Groq 설정을 먼저 읽고, 이 서비스의 `.env`에 있는
+저장소·GitHub App 설정으로 덮어씁니다. 이 환경은 Agent에만 전달되며 Runner에는 전달되지 않습니다.
+GitHub는 개인 계정 토큰 대신 설치 범위가 제한된 GitHub App의 1시간 설치 토큰을 자동 발급·갱신합니다.
+PEM 키는 저장소 밖에 두고 Compose에서 Agent에만 읽기 전용으로 마운트합니다.
 
 ```dotenv
 GEMINI_API_KEY=...
 GROQ_API_KEY=...
-GITHUB_TOKEN=... # 선택: 비우면 gh 로그인 사용
+GITHUB_AUTH_MODE=app
+GITHUB_APP_ID=4583096
+GITHUB_APP_INSTALLATION_ID=153482646
+GITHUB_APP_SLUG=auto-coding-issues
+GITHUB_APP_PRIVATE_KEY_PATH=/Users/dyn/.config/issue-to-pr-agent/github-app.pem
+GITHUB_TOKEN= # App 모드에서는 반드시 비움
 GITHUB_WEBHOOK_SECRET=충분히_긴_임의의_문자열 # webhook 모드에서만 필요
 GITHUB_REPOSITORY=owner/repository
 WORKSPACE_PATH=/absolute/path/to/local/repository
 ISSUE_SOURCE=poll
 LLM_MODEL=gemini/gemini-3.1-pro-preview
-GITHUB_EXPECTED_LOGIN=issue-agent-bot
 REQUIRED_VERIFICATION_COMMANDS=[["python","-m","unittest","discover","-s","tests","-v"]]
 ```
 
@@ -70,7 +75,7 @@ LLM_MODEL=ollama/qwen2.5-coder
 LLM_API_BASE=http://localhost:11434
 ```
 
-Fine-grained GitHub 토큰에는 대상 저장소의 다음 권한이 필요합니다.
+GitHub App은 대상 저장소에만 설치하고 다음 Repository permissions를 설정합니다.
 
 - Contents: Read and write
 - Pull requests: Read and write
@@ -78,13 +83,13 @@ Fine-grained GitHub 토큰에는 대상 저장소의 다음 권한이 필요합�
 - Checks: Read and write (`GITHUB_CHECKS_ENABLED=true`일 때)
 - Metadata: Read
 
-로컬 `origin`에도 해당 브랜치를 push할 인증이 설정되어 있어야 합니다.
-기본값은 정확히 `github.com/<GITHUB_REPOSITORY>`인 HTTPS/SSH origin만 허용합니다.
+App 모드의 Git fetch/push는 HTTPS와 단기 설치 토큰을 사용하며 토큰을 remote URL에 저장하지 않습니다.
+기본값은 정확히 `github.com/<GITHUB_REPOSITORY>`인 HTTPS origin만 허용합니다.
 `WORKSPACE_PATH`는 운영자가 신뢰하는 로컬 clone이어야 하며 임의 사용자가 등록할 수 없습니다.
 
 ## 실행: Docker Compose
 
-`.env`의 `WORKSPACE_PATH`를 호스트 대상 저장소 절대경로로 둔 뒤 실행합니다.
+`.env`의 `WORKSPACE_PATH`와 `GITHUB_APP_PRIVATE_KEY_PATH`를 호스트 절대경로로 둔 뒤 실행합니다.
 
 ```bash
 docker compose up --build
@@ -156,7 +161,7 @@ GitHub 저장소의 `Settings -> Webhooks -> Add webhook`에서 설정합니다.
 2. 정확 문자열·AST 기반 지역화의 Recall@5와 실제 Issue 해결률은 표본 acceptance issue로 측정해야 합니다.
 3. LLM이 만든 재현 테스트가 사용자의 의미 요구사항과 일치하는지는 자동으로 완전히 보장하지 못합니다.
 4. Runner는 대상 저장소 의존성을 자동 설치하지 않아 저장소별 잠금 이미지와 digest가 필요합니다.
-5. Agent 컨테이너는 네트워크·토큰·쓰기 가능한 mirror를 함께 가지므로 침해 시 단일 실패점입니다.
+5. Agent 컨테이너는 네트워크·App 개인키·단기 토큰·쓰기 가능한 mirror를 함께 가지므로 침해 시 단일 실패점입니다.
 6. SQLite 단일 Worker라 다중 인스턴스, 분산 lease와 수평 확장은 지원하지 않습니다.
 7. 일반 Docker 격리이므로 공개 저장소에는 gVisor·VM 같은 더 강한 샌드박스가 필요합니다.
 8. Check의 Required 정책과 Preview 모델의 수명·가격은 GitHub/Google 외부 설정에 의존합니다.

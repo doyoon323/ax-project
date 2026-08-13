@@ -1,4 +1,7 @@
 .env
+.coverage
+.coverage.*
+*.pem
 .state/
 .venv/
 .venv-py314-backup/

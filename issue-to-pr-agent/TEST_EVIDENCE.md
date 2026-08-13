@@ -1,16 +1,19 @@
 # Issue-to-PR Agent 검증 증거
 
-2026-08-13 로컬 검증 결과다. 테스트가 증명하는 범위와 외부 환경에서 아직 검증하지 않은 범위를
+2026-08-14 로컬·GitHub App 검증 결과다. 테스트가 증명하는 범위와 외부 환경에서 아직 검증하지 않은 범위를
 구분하며, 숫자만으로 실제 Issue 해결 정확도를 주장하지 않는다.
 
 ## 실행 결과
 
 ```text
-pytest: 50 passed
-branch coverage: 74% (2,068 statements, 678 branches)
+pytest: 55 passed
+branch coverage: 74% (2,234 statements, 726 branches)
 Ruff check/format: passed
 Docker Compose config: passed
 Agent/Runner images: built successfully with hashed Agent dependencies
+GitHub App: auto-coding-issues[bot] identity, target repository, required permissions passed
+Agent container: read-only PEM mount and GitHub App authentication passed
+Git HTTPS: short-lived installation token + GIT_ASKPASS ls-remote passed
 Runner runtime: healthy, network=none, rootfs=read-only, cap-drop=ALL
 ```
 
@@ -25,7 +28,7 @@ docker compose config --quiet
 docker compose build
 ```
 
-## 테스트 50개 분해
+## 테스트 55개 분해
 
 | 영역 | 개수 | 보장하는 내용 |
 |---|---:|---|
@@ -34,6 +37,7 @@ docker compose build
 | Tool·Runner 정책 | 9 | argv/path 허용 목록, 격리 실행, 복잡도 제한, ImportError 재현 거부 |
 | Git·게시 조정 | 4 | mirror/worktree, 승인 파일 push, dry-run, Check 실패 시 PR 차단 |
 | Webhook·Poller·작업 복구 | 21 | HMAC, 권한, 중복, 누적 원장, 재시도, hard kill, 종료 복구, 상태 표시 |
+| GitHub App 인증 | 5 | JWT·설치 토큰 cache, 신원·저장소·권한 거부, PAT 혼용 차단, Git 인증 환경 |
 
 ## Branch coverage
 
@@ -43,11 +47,12 @@ docker compose build
 | jobs | 85% | SQLite 상태 전이, 복구와 누적 사용량 |
 | worker | 82% | 일시/결정적 실패, hard timeout과 종료 복구 |
 | agent | 80% | 3단계 실행, correction, budget, fail-to-pass |
-| config | 80% | 주요 운영 제한값 검증 |
+| config | 81% | 주요 운영 제한값 검증 |
+| GitHub App auth | 80% | JWT·설치 토큰, 필수 권한과 저장소 접근 검증 |
 | service | 74% | dry-run, Check 선행과 게시 조정 |
 | tools | 73% | 명령·경로·편집·격리 backend 정책 |
 | main | 70% | Webhook 접수·중복 처리 중심 |
-| GitHub client | 62% | 로컬 Git과 REST 요청 생성; 실제 GitHub 응답은 미검증 |
+| GitHub client | 60% | 로컬 Git과 REST 요청 생성; 게시 API 전체 E2E는 미검증 |
 | poller | 55% | 단일 scan; 장기 polling loop 장애는 미검증 |
 | runner | 50% | 핵심 허용/거부; 모든 CLI 오류 분기는 미검증 |
 | **전체** | **74%** | branch coverage, 최소 기준 70% |
@@ -69,7 +74,7 @@ docker compose build
 
 - 강화된 현재 코드의 GitHub Issue → 유료 Gemini → push → Draft PR 전체 E2E
 - 지역화 후보의 Recall@5와 실제 Issue 해결률
-- 실제 봇 토큰의 Checks 권한, assignee와 Branch Protection 상호작용
+- 실제 Check·Draft PR 게시, assignee와 Branch Protection 상호작용
 - 공급자 usage 응답과 실제 청구 비용의 일치
 - 저장소별 의존성이 포함된 Runner 이미지와 image digest 고정
 - LLM이 만든 테스트가 사용자의 의미 요구사항과 일치한다는 독립 검증

@@ -122,7 +122,7 @@ LLM은 Tool을 직접 실행하지 않는다. 서버는 `shell=True`를 사용�
 - Compose에서는 Agent와 무권한 Runner를 분리하고 테스트 Runner에는 토큰과 네트워크를 주지 않는다.
 - 검증은 read-only root, capability 제거, CPU·메모리·PID 제한 컨테이너에서 실행한다.
 - Worktree는 브랜치·코드 격리일 뿐이며 Docker 검증 격리를 대체하지 않는다.
-- 게시 전에 GitHub 토큰 로그인과 기대 봇 로그인을 비교하고 커밋 작성자도 고정한다.
+- 게시 전에 GitHub App ID·slug·설치 저장소·필수 권한을 확인하고 커밋 작성자도 고정한다.
 - 실제 변경이 없으면 `no-change`로 종료하고 PR을 생성하지 않는다.
 - 파일 수·diff 줄 수를 넘는 복잡한 변경은 사람 검토 대상으로 중단한다.
 - 자동 병합 없이 Draft PR만 생성해 사람이 최종 검토한다.
@@ -138,6 +138,7 @@ LLM은 Tool을 직접 실행하지 않는다. 서버는 `shell=True`를 사용�
 - Gemini 기본, 선택적 운영자 지정 Fallback
 - 제한적 자동 재시도와 재시작 상태 복구
 - GitHub 상태 댓글과 토큰·모델 사용 기록
+- 저장소 한정 GitHub App 인증과 자동 갱신되는 단기 설치 토큰
 - 비밀·네트워크가 없는 별도 Runner 컨테이너 기반 필수 검증 게이트
 - 엄격한 fail-to-pass, 전체 회귀 테스트, 1회 교정, 시간·복잡도·누적 토큰·비용 제한
 - 작업별 OS 프로세스 watchdog과 종료 시 queue 복구
@@ -155,7 +156,7 @@ LLM은 Tool을 직접 실행하지 않는다. 서버는 `shell=True`를 사용�
 2. **정확도 측정:** 작은 정답 세트로 지역화 Recall@5와 Issue 해결률을 기록한다.
 3. **실행 이미지:** 대상 저장소 의존성을 잠그고 Agent/Runner image digest를 고정한다.
 4. **의미 정확성:** 사람이 작성한 acceptance test 또는 독립 검증으로 테스트 편향을 줄인다.
-5. **Agent 경계:** 네트워크·토큰·쓰기 mirror를 가진 Agent 컨테이너의 침해 범위를 줄인다.
+5. **Agent 경계:** 네트워크·App 개인키·단기 토큰·쓰기 mirror를 가진 Agent 컨테이너의 침해 범위를 줄인다.
 6. **운영 상태:** 필요해질 때만 SQLite 단일 Worker를 DB lease 기반 구조로 확장한다.
 7. **강한 격리:** 공개 저장소 지원 전 gVisor 또는 microVM을 사용한다.
 8. **외부 정책:** Required Check와 Preview 모델 가격·수명을 운영자가 관리한다.
