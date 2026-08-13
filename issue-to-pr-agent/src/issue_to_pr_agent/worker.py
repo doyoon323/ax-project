@@ -72,6 +72,8 @@ class JobWorker:
         process_timeout_seconds: float = 600.0,
         shutdown_timeout_seconds: float = 20.0,
         status_callback: StatusCallback | None = None,
+        status_update_attempts: int = 3,
+        status_update_retry_delay_seconds: float = 1.0,
     ) -> None:
         self.store = store
         self.processor = processor
@@ -80,6 +82,8 @@ class JobWorker:
         self.process_timeout_seconds = process_timeout_seconds
         self.shutdown_timeout_seconds = shutdown_timeout_seconds
         self.status_callback = status_callback
+        self.status_update_attempts = status_update_attempts
+        self.status_update_retry_delay_seconds = status_update_retry_delay_seconds
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
 
@@ -189,17 +193,34 @@ class JobWorker:
     ) -> None:
         if self.status_callback is None:
             return
-        try:
-            await asyncio.to_thread(
-                self.status_callback,
-                issue,
-                status,
-                attempt,
-                self.max_attempts if max_attempts is None else max_attempts,
-                detail,
-            )
-        except Exception:
-            logger.exception("GitHub-visible status update failed for Issue #%s", issue.number)
+        visible_max_attempts = self.max_attempts if max_attempts is None else max_attempts
+        for status_attempt in range(1, self.status_update_attempts + 1):
+            try:
+                await asyncio.to_thread(
+                    self.status_callback,
+                    issue,
+                    status,
+                    attempt,
+                    visible_max_attempts,
+                    detail,
+                )
+                return
+            except Exception as exc:
+                can_retry = self._is_retryable(exc) and status_attempt < self.status_update_attempts
+                if not can_retry:
+                    logger.exception(
+                        "GitHub-visible status update failed for Issue #%s after %s attempt(s)",
+                        issue.number,
+                        status_attempt,
+                    )
+                    return
+                logger.warning(
+                    "GitHub-visible status update attempt %s/%s failed for Issue #%s; retrying",
+                    status_attempt,
+                    self.status_update_attempts,
+                    issue.number,
+                )
+                await asyncio.sleep(self.status_update_retry_delay_seconds * status_attempt)
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:

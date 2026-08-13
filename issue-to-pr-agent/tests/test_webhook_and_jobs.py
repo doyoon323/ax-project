@@ -299,6 +299,64 @@ def test_worker_retries_and_persists_attempt_count(tmp_path: Path) -> None:
     assert store.attempt_count(issue.delivery_id) == 2
 
 
+def test_worker_retries_transient_status_update_without_rerunning_job(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    processor_calls_path = tmp_path / "processor-calls.txt"
+    status_calls: list[str] = []
+
+    class TransientStatusError(RuntimeError):
+        retryable = True
+
+    def processor(_: IssueTask) -> dict:
+        calls = (
+            int(processor_calls_path.read_text(encoding="utf-8"))
+            if processor_calls_path.exists()
+            else 0
+        )
+        processor_calls_path.write_text(str(calls + 1), encoding="utf-8")
+        return {"status": "processed"}
+
+    def status_callback(
+        _: IssueTask, status: str, _attempt: int, _maximum: int, _detail: str
+    ) -> None:
+        status_calls.append(status)
+        if status == "completed" and status_calls.count("completed") == 1:
+            raise TransientStatusError("temporary ssl failure")
+
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Fix a bug",
+        body=(
+            "Update sample.py so the returned value is two, and add a unit test that verifies "
+            "the new behavior."
+        ),
+        author="octocat",
+        author_association="OWNER",
+    )
+    worker = JobWorker(
+        store,
+        processor,
+        status_callback=status_callback,
+        status_update_retry_delay_seconds=0,
+    )
+
+    async def exercise_worker() -> None:
+        await worker.start()
+        await worker.submit(issue)
+        await worker.queue.join()
+        await worker.stop()
+
+    asyncio.run(exercise_worker())
+
+    assert store.status(issue.delivery_id) == "completed"
+    assert processor_calls_path.read_text(encoding="utf-8") == "1"
+    assert status_calls == ["running", "completed", "completed"]
+
+
 def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     attempts_path = tmp_path / "attempts.txt"
@@ -581,6 +639,15 @@ def test_github_status_comment_is_stable_and_sanitized() -> None:
     assert "재시도 대기" in body
     assert "temporary failure" in body
     assert "@issue-agent-bot" in body
+
+    bot_body = GitHubClient._status_comment_body(
+        status="completed",
+        attempt=2,
+        max_attempts=3,
+        detail="published",
+        actor="auto-coding-issues[bot]",
+    )
+    assert "@auto-coding-issues[bot]" in bot_body
 
 
 def test_untrusted_author_is_ignored(tmp_path: Path) -> None:

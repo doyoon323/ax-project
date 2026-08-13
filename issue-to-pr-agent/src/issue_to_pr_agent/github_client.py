@@ -737,7 +737,11 @@ class GitHubClient:
             "failed": "실패",
         }
         safe_detail = re.sub(r"[\r\n]+", " ", detail).strip()[:300]
-        safe_actor = re.sub(r"[^A-Za-z0-9-]", "", actor)[:39] or "unknown"
+        raw_actor = actor.strip().removeprefix("@")
+        if re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", raw_actor):
+            safe_actor = raw_actor[:45]
+        else:
+            safe_actor = re.sub(r"[^A-Za-z0-9-]", "", raw_actor)[:39] or "unknown"
         return (
             "<!-- issue-to-pr-agent-status -->\n"
             "### Issue-to-PR Agent 상태\n"
