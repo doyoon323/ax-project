@@ -41,8 +41,6 @@ class IssuePoller:
         issues = await asyncio.to_thread(self.github.list_candidate_issues)
         inserted = 0
         for issue in issues:
-            if self.worker.store.has_completed_issue(issue.repository, issue.number):
-                continue
             if await self.worker.submit(issue):
                 inserted += 1
                 logger.info("Detected GitHub Issue #%s and queued it", issue.number)

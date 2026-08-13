@@ -1,0 +1,9 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src
+RUN useradd --create-home --uid 10001 runner
+WORKDIR /app
+COPY src ./src
+USER 10001:10001
+ENTRYPOINT ["python", "-m", "issue_to_pr_agent.runner"]
+CMD ["--queue", "/runner-queue", "--worktrees", "/worktrees"]

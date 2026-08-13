@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
+import uuid
 from collections.abc import Iterable
+from io import BytesIO
 from pathlib import Path
 
 from .models import CommandResult, FileEdit, Phase
@@ -16,6 +23,18 @@ class ToolPolicyError(ValueError):
 
 class EditError(ValueError):
     """Raised when a structured edit cannot be applied exactly once."""
+
+
+class ComplexityLimitError(RuntimeError):
+    """Raised when an issue exceeds the bounded automatic-change policy."""
+
+
+class BaselineTestError(ComplexityLimitError):
+    """Raised when a baseline test failure is not valid fail-to-pass evidence."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 _READ_COMMANDS = {"head", "ls", "rg", "sed", "tail"}
@@ -60,30 +79,68 @@ class WorkspaceTools:
         root: Path,
         *,
         timeout_seconds: int = 30,
+        verification_timeout_seconds: int = 120,
         max_output_chars: int = 1_000,
         max_output_lines: int = 50,
+        verification_backend: str = "host",
+        verification_container_image: str = "python:3.13-slim",
+        verification_runner_queue_path: Path = Path("/runner-queue"),
+        runner_worktree_root: Path | None = None,
+        verification_runner_poll_seconds: float = 0.1,
     ) -> None:
         self.root = root.resolve(strict=True)
         self.timeout_seconds = timeout_seconds
+        self.verification_timeout_seconds = verification_timeout_seconds
         self.max_output_chars = max_output_chars
         self.max_output_lines = max_output_lines
+        self.verification_backend = verification_backend
+        self.verification_container_image = verification_container_image
+        self.verification_runner_queue_path = verification_runner_queue_path
+        self.runner_worktree_root = (
+            runner_worktree_root.resolve(strict=False) if runner_worktree_root else None
+        )
+        self.verification_runner_poll_seconds = verification_runner_poll_seconds
+        self.execution_deadline: float | None = None
         self.edited_paths: list[Path] = []
+
+    def set_execution_deadline(self, deadline: float) -> None:
+        self.execution_deadline = deadline
 
     def run(self, argv: list[str], phase: Phase) -> CommandResult:
         normalized, is_verification = self._validate_command(argv, phase)
+        configured_timeout = (
+            self.verification_timeout_seconds if is_verification else self.timeout_seconds
+        )
+        timeout = self._effective_timeout(configured_timeout)
+        if timeout <= 0:
+            return CommandResult(
+                argv=tuple(normalized),
+                return_code=124,
+                output="[Job execution deadline reached before command start]",
+                timed_out=True,
+                is_verification=is_verification,
+            )
+        if is_verification and self.verification_backend == "runner":
+            return self._run_via_runner(normalized, timeout)
+        if is_verification and self.verification_backend == "docker":
+            command = self._docker_command(normalized)
+            reported_argv = normalized
+        else:
+            command = self._host_command(normalized)
+            reported_argv = command
         try:
             completed = subprocess.run(
-                normalized,
+                command,
                 cwd=self.root,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout_seconds,
+                timeout=timeout,
                 check=False,
                 env=self._safe_environment(),
             )
             combined = self._combine_output(completed.stdout, completed.stderr)
             return CommandResult(
-                argv=tuple(normalized),
+                argv=tuple(reported_argv),
                 return_code=completed.returncode,
                 output=truncate_output(
                     combined,
@@ -97,14 +154,21 @@ class WorkspaceTools:
             stderr = exc.stderr if isinstance(exc.stderr, str) else ""
             combined = self._combine_output(stdout, stderr)
             return CommandResult(
-                argv=tuple(normalized),
+                argv=tuple(reported_argv),
                 return_code=124,
                 output=truncate_output(
-                    f"{combined}\n[Command timed out after {self.timeout_seconds}s]",
+                    f"{combined}\n[Command timed out after {timeout}s]",
                     max_chars=self.max_output_chars,
                     max_lines=self.max_output_lines,
                 ),
                 timed_out=True,
+                is_verification=is_verification,
+            )
+        except FileNotFoundError as exc:
+            return CommandResult(
+                argv=tuple(reported_argv),
+                return_code=127,
+                output=f"[Verification runtime unavailable: {Path(exc.filename or '').name}]",
                 is_verification=is_verification,
             )
 
@@ -170,6 +234,258 @@ class WorkspaceTools:
         )
         return bool(completed.stdout.strip())
 
+    def enforce_change_limits(self, *, max_files: int, max_diff_lines: int) -> None:
+        paths = list(dict.fromkeys(self.edited_paths))
+        if len(paths) > max_files:
+            raise ComplexityLimitError(
+                f"change touches {len(paths)} files; automatic limit is {max_files}"
+            )
+
+        total_lines = 0
+        accounted: set[Path] = set()
+        if paths:
+            completed = subprocess.run(
+                ["git", "diff", "--numstat", "--no-renames", "HEAD", "--", *map(str, paths)],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+                env=self._safe_environment(),
+            )
+            if completed.returncode != 0:
+                raise ComplexityLimitError("could not measure the proposed diff")
+            for line in completed.stdout.splitlines():
+                added, deleted, raw_path = line.split("\t", 2)
+                accounted.add(Path(raw_path))
+                if added == "-" or deleted == "-":
+                    total_lines = max_diff_lines + 1
+                    break
+                total_lines += int(added) + int(deleted)
+
+        for path in paths:
+            if path in accounted:
+                continue
+            candidate = self.root / path
+            if candidate.exists():
+                total_lines += len(candidate.read_text(encoding="utf-8").splitlines())
+
+        if total_lines > max_diff_lines:
+            raise ComplexityLimitError(
+                f"change contains {total_lines} added/deleted lines; "
+                f"automatic limit is {max_diff_lines}"
+            )
+
+    def run_fail_to_pass(
+        self,
+        test_paths: list[Path],
+        commands: list[list[str]],
+    ) -> list[CommandResult]:
+        """Run identical targeted tests on patched and base code and reject infra failures."""
+
+        if not test_paths:
+            raise ComplexityLimitError("fail-to-pass proof requires an edited regression test")
+        targeted_commands = self._targeted_baseline_commands(test_paths, commands)
+        current_results = [self.run(command, "verify") for command in targeted_commands]
+        if any(not result.succeeded for result in current_results):
+            raise ComplexityLimitError(
+                "edited regression tests must pass on the patched code before baseline comparison"
+            )
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD"],
+            cwd=self.root,
+            capture_output=True,
+            timeout=self.timeout_seconds,
+            check=False,
+            env=self._safe_environment(),
+        )
+        if archive.returncode != 0:
+            raise ComplexityLimitError("could not create a clean baseline snapshot")
+
+        temporary_root: Path | None = None
+        if self.verification_backend == "runner":
+            if self.runner_worktree_root is None:
+                raise ComplexityLimitError("runner backend requires a shared worktree root")
+            temporary_root = self.runner_worktree_root / ".baselines"
+            temporary_root.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(
+            prefix="issue-agent-baseline-",
+            dir=temporary_root,
+        ) as temporary:
+            baseline_root = Path(temporary)
+            with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:") as bundle:
+                self._extract_regular_files(bundle, baseline_root)
+            for relative in test_paths:
+                source = self.root / relative
+                if not source.is_file():
+                    raise ComplexityLimitError(f"regression test is not a file: {relative}")
+                destination = baseline_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+
+            baseline_tools = WorkspaceTools(
+                baseline_root,
+                timeout_seconds=self.timeout_seconds,
+                verification_timeout_seconds=self.verification_timeout_seconds,
+                max_output_chars=self.max_output_chars,
+                max_output_lines=self.max_output_lines,
+                verification_backend=self.verification_backend,
+                verification_container_image=self.verification_container_image,
+                verification_runner_queue_path=self.verification_runner_queue_path,
+                runner_worktree_root=self.runner_worktree_root,
+                verification_runner_poll_seconds=self.verification_runner_poll_seconds,
+            )
+            baseline_tools.execution_deadline = self.execution_deadline
+            baseline_results = [
+                baseline_tools.run(command, "verify") for command in targeted_commands
+            ]
+            for command, result in zip(targeted_commands, baseline_results, strict=True):
+                self._validate_meaningful_baseline_result(command, result)
+            return baseline_results
+
+    @staticmethod
+    def _validate_meaningful_baseline_result(command: list[str], result: CommandResult) -> None:
+        if result.succeeded:
+            return
+        if result.timed_out or result.return_code != 1:
+            raise BaselineTestError(
+                "baseline test failed because of timeout, collection, configuration, or "
+                "usage error",
+                reason="infrastructure",
+            )
+
+        output = result.output.casefold()
+        infrastructure_markers = (
+            "error collecting",
+            "failed to import test module",
+            "importerror",
+            "modulenotfounderror",
+            "syntaxerror",
+            "no tests ran",
+            "no tests found",
+            "usage error",
+            "internal error",
+        )
+        if any(marker in output for marker in infrastructure_markers):
+            raise BaselineTestError(
+                "baseline test failed because of an import, collection, or configuration error",
+                reason="import_or_collection",
+            )
+
+        executable = Path(command[0]).name
+        is_unittest = (
+            executable in {"python", "python3"} and command[1:3] == ["-m", "unittest"]
+        ) or (executable == "uv" and command[1:5] == ["run", "python", "-m", "unittest"])
+        if is_unittest and "fail:" not in output and "assertionerror" not in output:
+            raise BaselineTestError(
+                "baseline unittest failure was not an assertion failure in the targeted test",
+                reason="non_assertion",
+            )
+
+    @staticmethod
+    def _targeted_baseline_commands(
+        test_paths: list[Path], commands: list[list[str]]
+    ) -> list[list[str]]:
+        paths = [str(path) for path in test_paths]
+        targeted: list[list[str]] = []
+        for command in commands:
+            if not command:
+                continue
+            executable = Path(command[0]).name
+            if executable == "pytest":
+                targeted.append([*command, *paths])
+            elif executable in {"python", "python3"} and command[1:3] == ["-m", "pytest"]:
+                targeted.append([*command, *paths])
+            elif executable in {"python", "python3"} and command[1:3] == ["-m", "unittest"]:
+                targeted.append([*command[:3], *paths])
+            elif executable == "uv" and command[1:3] == ["run", "pytest"]:
+                targeted.append([*command, *paths])
+            elif executable == "uv" and command[1:5] == ["run", "python", "-m", "pytest"]:
+                targeted.append([*command, *paths])
+            elif executable == "uv" and command[1:5] == ["run", "python", "-m", "unittest"]:
+                targeted.append([*command[:5], *paths])
+        if not targeted:
+            raise ComplexityLimitError(
+                "fail-to-pass requires a pytest or unittest verification command"
+            )
+        return targeted
+
+    def _run_via_runner(self, argv: list[str], timeout: int) -> CommandResult:
+        if self.runner_worktree_root is None:
+            raise ToolPolicyError("runner backend requires a shared worktree root")
+        if not self.root.is_relative_to(self.runner_worktree_root):
+            raise ToolPolicyError("worktree is outside the shared runner root")
+
+        request_id = uuid.uuid4().hex
+        request_dir = self.verification_runner_queue_path / "requests"
+        response_dir = self.verification_runner_queue_path / "responses"
+        request_dir.mkdir(parents=True, exist_ok=True)
+        response_dir.mkdir(parents=True, exist_ok=True)
+        request_path = request_dir / f"{request_id}.json"
+        response_path = response_dir / f"{request_id}.json"
+        temporary_path = request_dir / f".{request_id}.tmp"
+        payload = {
+            "id": request_id,
+            "workspace": str(self.root.relative_to(self.runner_worktree_root)),
+            "argv": argv,
+            "timeout_seconds": timeout,
+        }
+        temporary_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary_path, request_path)
+
+        deadline = time.monotonic() + timeout + 1
+        try:
+            while time.monotonic() < deadline:
+                if response_path.exists():
+                    response = json.loads(response_path.read_text(encoding="utf-8"))
+                    return CommandResult(
+                        argv=tuple(argv),
+                        return_code=int(response["return_code"]),
+                        output=truncate_output(
+                            str(response["output"]),
+                            max_chars=self.max_output_chars,
+                            max_lines=self.max_output_lines,
+                        ),
+                        timed_out=bool(response.get("timed_out", False)),
+                        is_verification=True,
+                    )
+                time.sleep(self.verification_runner_poll_seconds)
+        finally:
+            request_path.unlink(missing_ok=True)
+            response_path.unlink(missing_ok=True)
+            temporary_path.unlink(missing_ok=True)
+
+        return CommandResult(
+            argv=tuple(argv),
+            return_code=124,
+            output="[Verification runner did not respond before the deadline]",
+            timed_out=True,
+            is_verification=True,
+        )
+
+    def _effective_timeout(self, configured_timeout: int) -> int:
+        if self.execution_deadline is None:
+            return configured_timeout
+        remaining = int(self.execution_deadline - time.monotonic() - 1)
+        return max(0, min(configured_timeout, remaining))
+
+    @staticmethod
+    def _extract_regular_files(bundle: tarfile.TarFile, destination_root: Path) -> None:
+        resolved_root = destination_root.resolve(strict=True)
+        for member in bundle.getmembers():
+            if not member.isfile():
+                continue
+            destination = (resolved_root / member.name).resolve(strict=False)
+            if not destination.is_relative_to(resolved_root):
+                raise ComplexityLimitError("baseline archive contains an unsafe path")
+            source = bundle.extractfile(member)
+            if source is None:
+                raise ComplexityLimitError("baseline archive contains an unreadable file")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
     def _validate_command(self, argv: list[str], phase: Phase) -> tuple[list[str], bool]:
         if not argv or len(argv) > 30 or any(not isinstance(item, str) for item in argv):
             raise ToolPolicyError("command must be a non-empty string array of at most 30 items")
@@ -217,16 +533,19 @@ class WorkspaceTools:
 
         if executable == "ruff":
             self._validate_ruff(argv)
-            return [sys.executable, "-m", "ruff", *argv[1:]], True
+            return ["python", "-m", "ruff", *argv[1:]], True
         if executable == "pytest":
-            return [sys.executable, "-m", "pytest", *argv[1:]], True
+            return ["python", "-m", "pytest", *argv[1:]], True
         if executable in {"python", "python3"}:
+            if len(argv) >= 3 and argv[1:3] == ["-m", "ruff"]:
+                self._validate_ruff(["ruff", *argv[3:]])
+                return ["python", *argv[1:]], True
             if len(argv) >= 3 and argv[1:3] in (
                 ["-m", "pytest"],
                 ["-m", "unittest"],
                 ["-m", "compileall"],
             ):
-                return [sys.executable, *argv[1:]], True
+                return ["python", *argv[1:]], True
             raise ToolPolicyError("python may only run pytest, unittest, or compileall modules")
         if executable == "uv":
             if len(argv) < 3 or argv[1] != "run":
@@ -245,6 +564,46 @@ class WorkspaceTools:
                 return argv, True
             raise ToolPolicyError("uv run may only execute pytest, ruff, or compileall")
         raise ToolPolicyError(f"command is not allowed: {executable}")
+
+    @staticmethod
+    def _host_command(argv: list[str]) -> list[str]:
+        if argv and argv[0] == "python":
+            return [sys.executable, *argv[1:]]
+        return argv
+
+    def _docker_command(self, argv: list[str]) -> list[str]:
+        if self.verification_backend != "docker":
+            raise ToolPolicyError("unsupported verification backend")
+        image_pattern = r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,200}"
+        if re.fullmatch(image_pattern, self.verification_container_image) is None:
+            raise ToolPolicyError("invalid verification container image")
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit=128",
+            "--memory=512m",
+            "--cpus=1.0",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--env",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "--env",
+            "PYTEST_ADDOPTS=-p no:cacheprovider",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=128m",
+            "--mount",
+            f"type=bind,src={self.root},dst=/workspace,ro",
+            "--workdir",
+            "/workspace",
+            self.verification_container_image,
+            *argv,
+        ]
 
     @staticmethod
     def _validate_read_command(argv: list[str]) -> None:
@@ -342,4 +701,7 @@ class WorkspaceTools:
     @staticmethod
     def _safe_environment() -> dict[str, str]:
         allowed = {"LANG", "LC_ALL", "PATH", "PYTHONPATH", "TERM", "TMPDIR", "VIRTUAL_ENV"}
-        return {key: value for key, value in os.environ.items() if key in allowed}
+        environment = {key: value for key, value in os.environ.items() if key in allowed}
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+        return environment

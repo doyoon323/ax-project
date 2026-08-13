@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
 from .config import Settings
+from .github_auth import GitHubAppAuthenticator, GitHubAppAuthError
 from .models import AgentRunResult, IssueTask
 
 
@@ -19,6 +22,17 @@ class GitOperationError(RuntimeError):
 
 class GitHubPublishError(RuntimeError):
     """Raised when the GitHub API cannot complete publication."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -38,15 +52,30 @@ class PublishResult:
 class GitWorkspaceManager:
     """Creates and cleans an isolated worktree without touching the user's checkout."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        authenticator: GitHubAppAuthenticator | None = None,
+    ) -> None:
         self.settings = settings
-        self.repository_root = settings.workspace_path.resolve(strict=True)
+        self.app_authenticator = (
+            authenticator
+            if authenticator is not None
+            else GitHubAppAuthenticator(settings)
+            if settings.github_auth_mode == "app"
+            else None
+        )
+        source_root = settings.workspace_path.resolve(strict=True)
+        self.repository_root = source_root
         self.worktree_root = settings.worktree_root.resolve(strict=False)
         if self.worktree_root == Path("/") or self.worktree_root.is_relative_to(
             self.repository_root
         ):
             raise GitOperationError("WORKTREE_ROOT must be outside the target repository")
-        self._validate_repository()
+        self._validate_repository(require_app_https=settings.repository_mirror_path is None)
+        if settings.repository_mirror_path is not None:
+            self._prepare_repository_mirror(source_root, settings.repository_mirror_path)
 
     def prepare(self, issue: IssueTask) -> WorktreeSession:
         delivery_suffix = re.sub(r"[^a-zA-Z0-9]", "", issue.delivery_id)[:8].lower()
@@ -92,29 +121,125 @@ class GitWorkspaceManager:
             )
 
         self._git(
-            ["commit", "-m", f"fix: auto-resolve issue #{issue_number}"],
+            [
+                "-c",
+                f"user.name={self.settings.git_author_name}",
+                "-c",
+                f"user.email={self.settings.git_author_email}",
+                "commit",
+                "-m",
+                f"fix: auto-resolve issue #{issue_number}",
+            ],
             cwd=session.path,
         )
+        remote_ref = f"refs/heads/{session.branch}"
+        existing = self._git(
+            ["ls-remote", "--heads", "origin", remote_ref],
+            cwd=session.path,
+        )
+        push_arguments = ["push", "--set-upstream"]
+        if existing:
+            remote_sha = existing.split(maxsplit=1)[0]
+            if re.fullmatch(r"[0-9a-f]{40,64}", remote_sha) is None:
+                raise GitOperationError("remote agent branch returned an invalid commit id")
+            push_arguments.append(f"--force-with-lease={remote_ref}:{remote_sha}")
+        push_arguments.extend(["origin", f"HEAD:{remote_ref}"])
         self._git(
-            ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{session.branch}"],
+            push_arguments,
             cwd=session.path,
             timeout=120,
         )
         return changed_files
+
+    def current_head(self, session: WorktreeSession) -> str:
+        head = self._git(["rev-parse", "HEAD"], cwd=session.path)
+        if re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+            raise GitOperationError("published worktree has an invalid commit id")
+        return head
 
     def cleanup(self, session: WorktreeSession) -> None:
         if session.path.exists():
             self._git(["worktree", "remove", "--force", str(session.path)])
         self._git(["branch", "-D", session.branch], allow_codes={0, 1})
 
-    def _validate_repository(self) -> None:
+    def _validate_repository(self, *, require_app_https: bool = False) -> None:
         root = self._git(["rev-parse", "--show-toplevel"], cwd=self.repository_root)
         if Path(root).resolve() != self.repository_root:
             raise GitOperationError("WORKSPACE_PATH must point to the target repository root")
         origin = self._git(["remote", "get-url", "origin"], cwd=self.repository_root)
-        normalized = origin.removesuffix(".git").replace(":", "/")
-        if not normalized.endswith(f"/{self.settings.github_repository}"):
+        if self._is_local_origin(origin):
+            if not self.settings.allow_local_git_origin:
+                raise GitOperationError("local Git origins are disabled")
+            return
+        if not self._matches_github_origin(origin):
             raise GitOperationError("origin remote does not match GITHUB_REPOSITORY")
+        if (
+            require_app_https
+            and self.settings.github_auth_mode == "app"
+            and not origin.startswith("https://")
+        ):
+            raise GitOperationError(
+                "GitHub App Git access requires an HTTPS origin or a repository mirror"
+            )
+
+    def _prepare_repository_mirror(self, source_root: Path, raw_mirror_path: Path) -> None:
+        mirror_path = raw_mirror_path.resolve(strict=False)
+        if (
+            mirror_path == Path("/")
+            or mirror_path == source_root
+            or mirror_path.is_relative_to(source_root)
+            or self.worktree_root.is_relative_to(mirror_path)
+            or mirror_path.is_relative_to(self.worktree_root)
+        ):
+            raise GitOperationError(
+                "REPOSITORY_MIRROR_PATH must be separate from the source and worktree roots"
+            )
+        source_origin = self._git(["remote", "get-url", "origin"], cwd=source_root)
+        if not mirror_path.exists():
+            mirror_path.parent.mkdir(parents=True, exist_ok=True)
+            completed = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={source_root}",
+                    "clone",
+                    "--no-checkout",
+                    "--no-hardlinks",
+                    str(source_root),
+                    str(mirror_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if completed.returncode != 0:
+                message = (completed.stderr or completed.stdout).strip()[:500]
+                raise GitOperationError(f"git clone for repository mirror failed: {message}")
+        self.repository_root = mirror_path.resolve(strict=True)
+        publish_origin = source_origin
+        if self.settings.github_auth_mode == "app":
+            publish_origin = f"https://github.com/{self.settings.github_repository}.git"
+        self._git(["remote", "set-url", "origin", publish_origin])
+        self._validate_repository(require_app_https=True)
+
+    @staticmethod
+    def _is_local_origin(origin: str) -> bool:
+        return origin.startswith(("/", "./", "../", "file://"))
+
+    def _matches_github_origin(self, origin: str) -> bool:
+        expected_path = f"/{self.settings.github_repository}"
+        if origin.startswith("git@github.com:"):
+            actual_path = "/" + origin.removeprefix("git@github.com:").removesuffix(".git")
+            return actual_path == expected_path
+        parsed = urlparse(origin)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "github.com"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path.removesuffix(".git") == expected_path
+        )
 
     def _git(
         self,
@@ -124,19 +249,47 @@ class GitWorkspaceManager:
         timeout: int = 60,
         allow_codes: set[int] | None = None,
     ) -> str:
+        environment = self._git_environment(arguments)
         completed = subprocess.run(
-            ["git", *arguments],
+            ["git", "-c", f"safe.directory={self.repository_root}", *arguments],
             cwd=cwd or self.repository_root,
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env=environment,
         )
         accepted = allow_codes or {0}
         if completed.returncode not in accepted:
             message = (completed.stderr or completed.stdout).strip()[:500]
             raise GitOperationError(f"git {arguments[0]} failed: {message}")
         return completed.stdout.strip()
+
+    def _git_environment(self, arguments: list[str]) -> dict[str, str] | None:
+        if self.settings.github_auth_mode != "app" or arguments[0] not in {
+            "fetch",
+            "ls-remote",
+            "push",
+        }:
+            return None
+        if self.app_authenticator is None:
+            raise GitOperationError("GitHub App authenticator is unavailable")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": str(self._git_askpass_path()),
+                "GITHUB_TOKEN": self.app_authenticator.installation_token(),
+            }
+        )
+        return environment
+
+    @staticmethod
+    def _git_askpass_path() -> Path:
+        installed = Path("/usr/local/bin/git-askpass")
+        if installed.is_file():
+            return installed
+        return Path(__file__).resolve().parents[2] / "docker" / "git-askpass.sh"
 
     @staticmethod
     def _reject_sensitive_path(raw_path: str) -> None:
@@ -158,18 +311,59 @@ class GitWorkspaceManager:
 class GitHubClient:
     """Minimal REST client for Draft PR creation, assignment, and issue comments."""
 
-    def __init__(self, settings: Settings, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        session: requests.Session | None = None,
+        *,
+        authenticator: GitHubAppAuthenticator | None = None,
+    ) -> None:
         self.settings = settings
         self.session = session or requests.Session()
+        self.app_authenticator = (
+            authenticator
+            if authenticator is not None
+            else GitHubAppAuthenticator(settings)
+            if settings.github_auth_mode == "app"
+            else None
+        )
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": settings.github_api_version,
             "User-Agent": "issue-to-pr-agent/0.1",
         }
-        token = self._resolve_token()
+        token = self._resolve_token() if settings.github_auth_mode == "token" else ""
         if token:
             headers["Authorization"] = f"Bearer {token}"
         self.session.headers.update(headers)
+        self.identity_login = ""
+
+    def validate_identity(self) -> str:
+        """Fail closed before publication when the token belongs to an unexpected account."""
+
+        if self.settings.github_auth_mode == "app":
+            if self.app_authenticator is None:
+                raise GitHubPublishError("GitHub App authenticator is unavailable")
+            try:
+                login = self.app_authenticator.validate()
+            except GitHubAppAuthError as exc:
+                raise GitHubPublishError(
+                    str(exc),
+                    status_code=exc.status_code,
+                    retryable=exc.retryable,
+                ) from exc
+            self.identity_login = login
+            return login
+
+        payload = self._request("GET", "/user", expected={200})
+        login = str((payload or {}).get("login") or "")
+        expected = self.settings.github_expected_login
+        if not login or login.casefold() != expected.casefold():
+            raise GitHubPublishError(
+                f"GitHub token identity mismatch; expected {expected!r}, received {login!r}"
+            )
+        self.identity_login = login
+        return login
 
     def list_candidate_issues(self) -> list[IssueTask]:
         """Return open labeled Issues eligible for the local polling worker."""
@@ -240,6 +434,103 @@ class GitHubClient:
             expected={201},
         )
 
+    def upsert_status_comment(
+        self,
+        issue_number: int,
+        *,
+        status: str,
+        attempt: int,
+        max_attempts: int,
+        detail: str,
+    ) -> None:
+        marker = "<!-- issue-to-pr-agent-status -->"
+        comments = self._request(
+            "GET",
+            f"/repos/{self.settings.github_repository}/issues/{issue_number}/comments",
+            params={"per_page": 100},
+            expected={200},
+        )
+        existing = next(
+            (
+                item
+                for item in comments
+                if isinstance(item, dict) and marker in str(item.get("body") or "")
+            ),
+            None,
+        )
+        body = self._status_comment_body(
+            status=status,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            detail=detail,
+            actor=self.identity_login or self.settings.github_expected_login,
+        )
+        if existing is None:
+            self.comment_on_issue(issue_number, body)
+            return
+        comment_id = existing.get("id")
+        if not isinstance(comment_id, int):
+            raise GitHubPublishError("existing Agent status comment has no numeric id")
+        self._request(
+            "PATCH",
+            f"/repos/{self.settings.github_repository}/issues/comments/{comment_id}",
+            json={"body": body},
+            expected={200},
+        )
+
+    def upsert_verification_check(
+        self,
+        issue: IssueTask,
+        head_sha: str,
+        result: AgentRunResult,
+    ) -> None:
+        name = "Issue-to-PR Agent / verification"
+        payload = {
+            "name": name,
+            "head_sha": head_sha,
+            "external_id": issue.delivery_id,
+            "status": "completed",
+            "conclusion": "success",
+            "output": {
+                "title": "Bounded verification passed",
+                "summary": self._check_summary(result),
+            },
+        }
+        existing = self._request(
+            "GET",
+            f"/repos/{self.settings.github_repository}/commits/{head_sha}/check-runs",
+            params={"check_name": name, "filter": "latest", "per_page": 100},
+            expected={200},
+        )
+        check_runs = (existing or {}).get("check_runs", [])
+        match = next(
+            (
+                item
+                for item in check_runs
+                if isinstance(item, dict) and item.get("external_id") == issue.delivery_id
+            ),
+            None,
+        )
+        if match is None:
+            self._request(
+                "POST",
+                f"/repos/{self.settings.github_repository}/check-runs",
+                json=payload,
+                expected={201},
+            )
+            return
+        check_id = match.get("id")
+        if not isinstance(check_id, int):
+            raise GitHubPublishError("existing verification check has no numeric id")
+        update = dict(payload)
+        update.pop("head_sha")
+        self._request(
+            "PATCH",
+            f"/repos/{self.settings.github_repository}/check-runs/{check_id}",
+            json=update,
+            expected={200},
+        )
+
     def _find_pull_request(self, branch: str) -> dict[str, Any] | None:
         owner = self.settings.github_repository.split("/", 1)[0]
         pulls = self._request(
@@ -251,6 +542,7 @@ class GitHubClient:
         return pulls[0] if pulls else None
 
     def _try_assign(self, pr_number: int, author: str) -> tuple[bool, str]:
+        self._refresh_authorization()
         try:
             check = self.session.get(
                 self._url(f"/repos/{self.settings.github_repository}/assignees/{author}"),
@@ -279,14 +571,19 @@ class GitHubClient:
         expected: set[int],
         **kwargs: Any,
     ) -> Any:
+        self._refresh_authorization()
         try:
             response = self.session.request(method, self._url(path), timeout=30, **kwargs)
         except requests.RequestException as exc:
-            raise GitHubPublishError(f"GitHub API request failed: {type(exc).__name__}") from exc
+            raise GitHubPublishError(
+                f"GitHub API request failed: {type(exc).__name__}", retryable=True
+            ) from exc
         if response.status_code not in expected:
             request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
             raise GitHubPublishError(
-                f"GitHub API returned {response.status_code}; request id={request_id}"
+                f"GitHub API returned {response.status_code}; request id={request_id}",
+                status_code=response.status_code,
+                retryable=response.status_code == 429 or response.status_code >= 500,
             )
         if not response.content:
             return None
@@ -313,6 +610,21 @@ class GitHubClient:
         except (FileNotFoundError, subprocess.SubprocessError):
             return ""
         return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    def _refresh_authorization(self) -> None:
+        if self.settings.github_auth_mode != "app":
+            return
+        if self.app_authenticator is None:
+            raise GitHubPublishError("GitHub App authenticator is unavailable")
+        try:
+            token = self.app_authenticator.installation_token()
+        except GitHubAppAuthError as exc:
+            raise GitHubPublishError(
+                str(exc),
+                status_code=exc.status_code,
+                retryable=exc.retryable,
+            ) from exc
+        self.session.headers["Authorization"] = f"Bearer {token}"
 
     def _to_issue_task(self, payload: dict[str, Any]) -> IssueTask | None:
         if "pull_request" in payload:
@@ -345,7 +657,9 @@ class GitHubClient:
         if body is not None and not isinstance(body, str):
             return None
 
-        fingerprint = f"{self.settings.github_repository}:{number}".encode()
+        # Comments (including our status comment) do not affect this revision key.
+        # Editing the Issue title/body creates a deliberate new poll job after a final failure.
+        fingerprint = (f"{self.settings.github_repository}:{number}:{title}:{body or ''}").encode()
         delivery_id = f"poll-{hashlib.sha256(fingerprint).hexdigest()[:32]}"
         return IssueTask(
             delivery_id=delivery_id,
@@ -364,10 +678,76 @@ class GitHubClient:
             for item in result.verification_results
         )
         details = result.pr_body.strip() or result.summary
+        models = ", ".join(f"`{model}`" for model in result.model_history) or "not recorded"
+        usage = (
+            f"{result.total_tokens} "
+            f"(input {result.prompt_tokens}, output {result.completion_tokens})"
+            if result.total_tokens
+            else "not reported by provider"
+        )
+        baseline = (
+            "failed as expected"
+            if result.baseline_verification_results
+            and any(not item.succeeded for item in result.baseline_verification_results)
+            else "not recorded"
+        )
         return (
             f"{details}\n\n"
             "### Verification\n"
             f"{verification or '- No verification recorded'}\n\n"
+            "### Agent run\n"
+            f"- Models: {models}\n"
+            f"- Recorded tokens: {usage}\n"
+            f"- Estimated cost: `${result.estimated_cost_usd:.4f}`\n"
+            f"- Correction cycles: {result.correction_cycles}\n"
+            f"- Fail-to-pass baseline: {baseline}\n"
+            f"- Duration: {result.duration_seconds:.3f}s\n\n"
             f"Closes #{issue.number}\n\n"
             "_Generated as a Draft PR by Issue-to-PR Agent. Human review is required._"
+        )
+
+    @staticmethod
+    def _check_summary(result: AgentRunResult) -> str:
+        commands = "\n".join(
+            f"- `{' '.join(item.argv)}`: {'passed' if item.succeeded else 'failed'}"
+            for item in result.verification_results
+        )
+        return (
+            f"{commands or '- No commands recorded'}\n\n"
+            "Fail-to-pass: "
+            f"{'passed' if result.baseline_verification_results else 'not recorded'}; "
+            f"corrections: {result.correction_cycles}; "
+            f"tokens: {result.total_tokens}; "
+            f"estimated cost: ${result.estimated_cost_usd:.4f}."
+        )[:65_000]
+
+    @staticmethod
+    def _status_comment_body(
+        *,
+        status: str,
+        attempt: int,
+        max_attempts: int,
+        detail: str,
+        actor: str,
+    ) -> str:
+        labels = {
+            "running": "진행 중",
+            "retrying": "재시도 대기",
+            "completed": "완료",
+            "failed": "실패",
+        }
+        safe_detail = re.sub(r"[\r\n]+", " ", detail).strip()[:300]
+        raw_actor = actor.strip().removeprefix("@")
+        if re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", raw_actor):
+            safe_actor = raw_actor[:45]
+        else:
+            safe_actor = re.sub(r"[^A-Za-z0-9-]", "", raw_actor)[:39] or "unknown"
+        return (
+            "<!-- issue-to-pr-agent-status -->\n"
+            "### Issue-to-PR Agent 상태\n"
+            f"- 상태: **{labels.get(status, status)}**\n"
+            f"- 시도: {attempt}/{max_attempts}\n"
+            f"- 실행 신원: @{safe_actor}\n"
+            f"- 설명: {safe_detail or '-'}\n\n"
+            "이 댓글은 새 상태로 갱신됩니다."
         )

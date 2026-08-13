@@ -66,5 +66,15 @@ class AgentRunResult:
     pr_title: str = ""
     pr_body: str = ""
     verification_results: list[CommandResult] = field(default_factory=list)
+    baseline_verification_results: list[CommandResult] = field(default_factory=list)
     changed_paths: list[str] = field(default_factory=list)
+    model_history: list[str] = field(default_factory=list)
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    correction_cycles: int = 0
+    duration_seconds: float = 0.0
+    localization_candidates: list[str] = field(default_factory=list)
+    localization_scanned_files: int = 0
     workspace: Path | None = None

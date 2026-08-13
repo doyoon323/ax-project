@@ -4,12 +4,14 @@ import hashlib
 import hmac
 import json
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
+from . import __version__
 from .config import Settings, get_settings
 from .github_client import GitHubClient
 from .jobs import JobStore
@@ -97,7 +99,15 @@ def create_app(
         active_processor = service.process
     else:
         active_processor = processor
-    worker = JobWorker(store, active_processor)
+    worker = JobWorker(
+        store,
+        active_processor,
+        max_attempts=active_settings.job_max_attempts,
+        retry_delay_seconds=active_settings.job_retry_delay_seconds,
+        process_timeout_seconds=active_settings.job_timeout_seconds,
+        shutdown_timeout_seconds=active_settings.worker_shutdown_timeout_seconds,
+        status_callback=service.report_status if service is not None else None,
+    )
     poller = (
         IssuePoller(
             service.github if service is not None else GitHubClient(active_settings),
@@ -120,14 +130,20 @@ def create_app(
                 await poller.stop()
             await worker.stop()
 
-    app = FastAPI(title="Issue-to-PR Agent", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Issue-to-PR Agent", version=__version__, lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        runner_ready = True
+        if active_settings.verification_backend == "runner":
+            heartbeat = active_settings.verification_runner_queue_path / "runner-heartbeat"
+            runner_ready = heartbeat.exists() and time.time() - heartbeat.stat().st_mtime < 10
         return {
-            "status": "ok",
+            "status": "ok" if runner_ready else "degraded",
             "issue_source": active_settings.issue_source,
             "publish_enabled": active_settings.publish_enabled,
+            "verification_backend": active_settings.verification_backend,
+            "verification_runner_ready": runner_ready,
         }
 
     @app.post("/webhook")
@@ -163,6 +179,7 @@ def create_app(
         if not inserted:
             return {
                 "status": "duplicate",
+                "job_status": store.status(delivery_id),
                 "issue_number": issue.number,
                 "delivery_id": delivery_id,
             }

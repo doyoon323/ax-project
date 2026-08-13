@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
@@ -19,22 +19,58 @@ class Settings(BaseSettings):
     github_webhook_secret: SecretStr = SecretStr("")
     github_repository: str
     workspace_path: Path
+    github_auth_mode: Literal["token", "app"] = "token"
+    github_app_id: int | None = None
+    github_app_installation_id: int | None = None
+    github_app_slug: str = ""
+    github_app_private_key_path: Path | None = None
 
     issue_source: Literal["webhook", "poll"] = "webhook"
     poll_interval_seconds: float = 15.0
-    llm_model: str = "gemini/gemini-3.6-flash"
+    llm_model: str = "gemini/gemini-3.1-pro-preview"
     llm_fallback_model: str | None = None
     llm_api_base: str | None = None
     llm_retries: int = 2
+    llm_max_output_tokens: int = 8_192
+    max_total_tokens_per_job: int = 30_000
+    max_estimated_cost_usd: float = 0.50
+    model_input_cost_per_million_usd: float = 2.0
+    model_output_cost_per_million_usd: float = 12.0
+    require_usage_accounting: bool = True
     base_branch: str = "main"
     max_turns: int = 3
     turn_delay_seconds: float = 4.1
     required_issue_label: str = "ai-fix"
     allowed_author_associations: str = "OWNER,MEMBER,COLLABORATOR"
     publish_enabled: bool = False
+    github_expected_login: str = ""
+    git_author_name: str = "Issue-to-PR Agent"
+    git_author_email: str = "issue-to-pr-agent@users.noreply.github.com"
     fetch_before_run: bool = True
+    allow_local_git_origin: bool = False
     require_verification: bool = True
+    require_fail_to_pass: bool = True
+    max_correction_cycles: int = 1
+    required_verification_commands: list[list[str]] = Field(
+        default_factory=lambda: [["python", "-m", "unittest", "discover", "-s", "tests", "-v"]]
+    )
+    verification_backend: Literal["docker", "host", "runner"] = "docker"
+    verification_container_image: str = "python:3.13-slim"
+    verification_runner_queue_path: Path = Path("/runner-queue")
+    verification_runner_poll_seconds: float = 0.1
+    allow_host_verification: bool = False
+    verification_timeout_seconds: int = 120
+    job_timeout_seconds: int = 600
+    worker_shutdown_timeout_seconds: float = 20.0
+    max_changed_files: int = 8
+    max_diff_lines: int = 800
+    localization_max_files: int = 5
+    localization_tree_entries: int = 200
+    localization_max_context_chars: int = 12_000
     keep_failed_worktree: bool = False
+    job_max_attempts: int = 3
+    job_retry_delay_seconds: float = 10.0
+    repository_mirror_path: Path | None = None
     worktree_root: Path = Path("/tmp/issue-to-pr-agent/worktrees")
     state_db_path: Path = Path(".state/jobs.sqlite3")
     command_timeout_seconds: int = 30
@@ -42,6 +78,7 @@ class Settings(BaseSettings):
     max_output_lines: int = 50
     github_api_url: str = "https://api.github.com"
     github_api_version: str = "2022-11-28"
+    github_checks_enabled: bool = True
 
     model_config = SettingsConfigDict(
         env_file=None,
@@ -58,6 +95,13 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_REPOSITORY must use the owner/repository form")
         return value
 
+    @field_validator("github_app_id", "github_app_installation_id")
+    @classmethod
+    def validate_github_app_identifiers(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("GitHub App identifiers must be positive integers")
+        return value
+
     @field_validator("max_turns")
     @classmethod
     def enforce_three_turn_cap(cls, value: int) -> int:
@@ -70,6 +114,151 @@ class Settings(BaseSettings):
     def bound_llm_retries(cls, value: int) -> int:
         if not 0 <= value <= 3:
             raise ValueError("LLM_RETRIES must be between 0 and 3")
+        return value
+
+    @field_validator("llm_max_output_tokens")
+    @classmethod
+    def bound_llm_output(cls, value: int) -> int:
+        if not 512 <= value <= 16_384:
+            raise ValueError("LLM_MAX_OUTPUT_TOKENS must be between 512 and 16384")
+        return value
+
+    @field_validator("max_total_tokens_per_job")
+    @classmethod
+    def bound_total_tokens(cls, value: int) -> int:
+        if not 1_000 <= value <= 200_000:
+            raise ValueError("MAX_TOTAL_TOKENS_PER_JOB must be between 1000 and 200000")
+        return value
+
+    @field_validator("max_estimated_cost_usd")
+    @classmethod
+    def bound_cost_budget(cls, value: float) -> float:
+        if not 0.01 <= value <= 20:
+            raise ValueError("MAX_ESTIMATED_COST_USD must be between 0.01 and 20")
+        return value
+
+    @field_validator(
+        "model_input_cost_per_million_usd",
+        "model_output_cost_per_million_usd",
+    )
+    @classmethod
+    def validate_model_prices(cls, value: float) -> float:
+        if not 0 <= value <= 100:
+            raise ValueError("model token prices must be between 0 and 100 USD per million")
+        return value
+
+    @field_validator("max_correction_cycles")
+    @classmethod
+    def bound_correction_cycles(cls, value: int) -> int:
+        if not 0 <= value <= 2:
+            raise ValueError("MAX_CORRECTION_CYCLES must be between 0 and 2")
+        return value
+
+    @field_validator("job_timeout_seconds")
+    @classmethod
+    def bound_job_timeout(cls, value: int) -> int:
+        if not 60 <= value <= 3_600:
+            raise ValueError("JOB_TIMEOUT_SECONDS must be between 60 and 3600")
+        return value
+
+    @field_validator("worker_shutdown_timeout_seconds")
+    @classmethod
+    def bound_worker_shutdown_timeout(cls, value: float) -> float:
+        if not 1 <= value <= 300:
+            raise ValueError("WORKER_SHUTDOWN_TIMEOUT_SECONDS must be between 1 and 300")
+        return value
+
+    @field_validator("max_changed_files")
+    @classmethod
+    def bound_changed_files(cls, value: int) -> int:
+        if not 1 <= value <= 50:
+            raise ValueError("MAX_CHANGED_FILES must be between 1 and 50")
+        return value
+
+    @field_validator("max_diff_lines")
+    @classmethod
+    def bound_diff_lines(cls, value: int) -> int:
+        if not 20 <= value <= 10_000:
+            raise ValueError("MAX_DIFF_LINES must be between 20 and 10000")
+        return value
+
+    @field_validator("localization_max_files")
+    @classmethod
+    def bound_localization_files(cls, value: int) -> int:
+        if not 1 <= value <= 10:
+            raise ValueError("LOCALIZATION_MAX_FILES must be between 1 and 10")
+        return value
+
+    @field_validator("localization_tree_entries")
+    @classmethod
+    def bound_localization_tree(cls, value: int) -> int:
+        if not 20 <= value <= 1_000:
+            raise ValueError("LOCALIZATION_TREE_ENTRIES must be between 20 and 1000")
+        return value
+
+    @field_validator("localization_max_context_chars")
+    @classmethod
+    def bound_localization_context(cls, value: int) -> int:
+        if not 2_000 <= value <= 30_000:
+            raise ValueError("LOCALIZATION_MAX_CONTEXT_CHARS must be between 2000 and 30000")
+        return value
+
+    @field_validator("job_max_attempts")
+    @classmethod
+    def bound_job_attempts(cls, value: int) -> int:
+        if not 1 <= value <= 5:
+            raise ValueError("JOB_MAX_ATTEMPTS must be between 1 and 5")
+        return value
+
+    @field_validator("job_retry_delay_seconds")
+    @classmethod
+    def bound_job_retry_delay(cls, value: float) -> float:
+        if not 0 <= value <= 300:
+            raise ValueError("JOB_RETRY_DELAY_SECONDS must be between 0 and 300")
+        return value
+
+    @field_validator("verification_timeout_seconds")
+    @classmethod
+    def bound_verification_timeout(cls, value: int) -> int:
+        if not 10 <= value <= 900:
+            raise ValueError("VERIFICATION_TIMEOUT_SECONDS must be between 10 and 900")
+        return value
+
+    @field_validator("verification_runner_poll_seconds")
+    @classmethod
+    def bound_runner_poll_interval(cls, value: float) -> float:
+        if not 0.02 <= value <= 2:
+            raise ValueError("VERIFICATION_RUNNER_POLL_SECONDS must be between 0.02 and 2")
+        return value
+
+    @field_validator("required_verification_commands")
+    @classmethod
+    def validate_required_verification_commands(cls, value: list[list[str]]) -> list[list[str]]:
+        if not value:
+            raise ValueError("REQUIRED_VERIFICATION_COMMANDS must contain at least one command")
+        for command in value:
+            if not command or len(command) > 30 or any(not item.strip() for item in command):
+                raise ValueError("each required verification command must be a non-empty argv list")
+        return value
+
+    @field_validator(
+        "github_expected_login",
+        "github_app_slug",
+        "git_author_name",
+        "git_author_email",
+    )
+    @classmethod
+    def reject_identity_control_characters(cls, value: str) -> str:
+        if "\n" in value or "\r" in value or "\x00" in value:
+            raise ValueError("identity values cannot contain control characters")
+        return value.strip()
+
+    @field_validator("github_app_slug")
+    @classmethod
+    def validate_github_app_slug(cls, value: str) -> str:
+        invalid_character = any(not (char.isalnum() or char == "-") for char in value)
+        if value and (len(value) > 100 or invalid_character):
+            raise ValueError("GITHUB_APP_SLUG must contain only letters, numbers, or hyphens")
         return value
 
     @field_validator("turn_delay_seconds")
@@ -100,6 +289,27 @@ class Settings(BaseSettings):
             )
         if self.issue_source == "webhook" and not self.github_webhook_secret.get_secret_value():
             raise ValueError("GITHUB_WEBHOOK_SECRET is required in webhook mode")
+        if self.github_auth_mode == "app":
+            if self.github_token.get_secret_value():
+                raise ValueError("GITHUB_TOKEN must be empty when GITHUB_AUTH_MODE=app")
+            if not self.github_app_id or not self.github_app_installation_id:
+                raise ValueError(
+                    "GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID are required in app mode"
+                )
+            if not self.github_app_slug or self.github_app_private_key_path is None:
+                raise ValueError(
+                    "GITHUB_APP_SLUG and GITHUB_APP_PRIVATE_KEY_PATH are required in app mode"
+                )
+        if (
+            self.publish_enabled
+            and self.github_auth_mode == "token"
+            and not self.github_expected_login
+        ):
+            raise ValueError("GITHUB_EXPECTED_LOGIN is required when PUBLISH_ENABLED=true")
+        if self.verification_backend == "host" and not self.allow_host_verification:
+            raise ValueError(
+                "ALLOW_HOST_VERIFICATION=true is required for the unsafe host verification backend"
+            )
         return self
 
     @property
