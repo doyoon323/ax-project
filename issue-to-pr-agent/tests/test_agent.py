@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from issue_to_pr_agent.agent import AgentBudgetError, IssueFixAgent
+from issue_to_pr_agent.agent import AgentBudgetError, AgentExecutionError, IssueFixAgent
 from issue_to_pr_agent.config import Settings
 from issue_to_pr_agent.models import IssueTask
 from issue_to_pr_agent.tools import WorkspaceTools
@@ -438,3 +438,66 @@ def test_provider_usage_stops_at_token_budget(tmp_path: Path) -> None:
 
     with pytest.raises(AgentBudgetError, match="token budget exceeded"):
         agent._record_usage(over_budget)
+
+
+def test_fail_to_pass_rejects_test_that_already_passes_on_base(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "sample.py").write_text("value = 1\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_sample.py").write_text(
+        "import unittest\n\n"
+        "class ValueTest(unittest.TestCase):\n"
+        "    def test_value(self):\n        self.assertTrue(True)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    replies = iter(
+        [
+            response({"phase": "diagnose", "note": "inspect", "commands": []}),
+            response(
+                {
+                    "phase": "patch",
+                    "note": "change code and weak test",
+                    "edits": [
+                        {"path": "sample.py", "search": "value = 1", "replace": "value = 2"},
+                        {
+                            "path": "tests/test_sample.py",
+                            "search": "self.assertTrue(True)",
+                            "replace": "self.assertEqual(1, 1)",
+                        },
+                    ],
+                    "commands": [],
+                }
+            ),
+            response(
+                {
+                    "phase": "verify",
+                    "note": "verify",
+                    "commands": [],
+                    "finish": True,
+                    "summary": "changed value",
+                }
+            ),
+        ]
+    )
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=10,
+        title="Set value to two",
+        body="The value must be two.",
+        author="octocat",
+        author_association="OWNER",
+    )
+    settings = make_settings(tmp_path).model_copy(update={"require_fail_to_pass": True})
+
+    with pytest.raises(AgentExecutionError, match="edited tests also pass"):
+        IssueFixAgent(
+            settings,
+            completion_fn=lambda **_: next(replies),
+            sleep_fn=lambda _: None,
+        ).run(issue, WorkspaceTools(tmp_path))

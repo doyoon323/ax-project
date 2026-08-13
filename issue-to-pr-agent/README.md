@@ -13,7 +13,8 @@ GitHub Issue(opened/labeled 또는 주기 조회)
   -> commit/push -> Draft PR -> assignee/comment
 ```
 
-전체 결정사항과 비범위는 [FINAL_SPEC.md](FINAL_SPEC.md)에 있습니다.
+전체 결정사항과 비범위는 [FINAL_SPEC.md](FINAL_SPEC.md), 검증 수준과 테스트 분해는
+[TEST_EVIDENCE.md](TEST_EVIDENCE.md)에 있습니다.
 
 ## 안전한 기본값
 
@@ -137,6 +138,8 @@ GitHub 저장소의 `Settings -> Webhooks -> Add webhook`에서 설정합니다.
 
 ```bash
 .venv/bin/pytest -q
+.venv/bin/coverage run -m pytest -q
+.venv/bin/coverage report
 .venv/bin/ruff check
 .venv/bin/ruff format --check
 ```

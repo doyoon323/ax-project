@@ -19,7 +19,7 @@ def git(cwd: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def test_worktree_publishes_only_explicit_agent_edits(tmp_path: Path) -> None:
+def test_worktree_publishes_edits_and_recovers_existing_remote_branch(tmp_path: Path) -> None:
     remote = tmp_path / "owner" / "repository.git"
     remote.parent.mkdir()
     git(tmp_path, "init", "--bare", "-q", str(remote))

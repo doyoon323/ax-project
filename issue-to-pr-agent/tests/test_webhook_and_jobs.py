@@ -4,7 +4,10 @@ import asyncio
 import hashlib
 import hmac
 import json
+import multiprocessing
+import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -16,6 +19,15 @@ from issue_to_pr_agent.jobs import JobStore
 from issue_to_pr_agent.main import create_app, extract_issue_task, verify_webhook_signature
 from issue_to_pr_agent.models import AgentRunResult, CommandResult, IssueTask
 from issue_to_pr_agent.worker import JobWorker
+
+
+def mark_running_until_killed(db_path: str, issue: IssueTask, ready: Any) -> None:
+    store = JobStore(Path(db_path))
+    store.initialize()
+    store.enqueue(issue)
+    store.mark_running(issue.delivery_id)
+    ready.set()
+    time.sleep(30)
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -288,6 +300,40 @@ def test_running_job_is_recovered_within_retry_budget(tmp_path: Path) -> None:
     recovery = store.recover(max_attempts=2)
     assert recovery.queued == [issue.delivery_id]
     assert recovery.exhausted == []
+    assert store.status(issue.delivery_id) == "queued"
+
+
+def test_abrupt_process_kill_recovers_running_job(tmp_path: Path) -> None:
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Fix a bug",
+        body="Expected behavior",
+        author="octocat",
+        author_association="OWNER",
+    )
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(
+        target=mark_running_until_killed,
+        args=(str(tmp_path / "jobs.sqlite3"), issue, ready),
+    )
+    process.start()
+    try:
+        assert ready.wait(timeout=10)
+        process.kill()
+        process.join(timeout=10)
+        assert process.exitcode is not None and process.exitcode != 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    recovery = store.recover(max_attempts=2)
+
+    assert recovery.queued == [issue.delivery_id]
     assert store.status(issue.delivery_id) == "queued"
 
 
