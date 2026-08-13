@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
+from . import __version__
 from .config import Settings, get_settings
 from .github_client import GitHubClient
 from .jobs import JobStore
@@ -129,7 +130,7 @@ def create_app(
                 await poller.stop()
             await worker.stop()
 
-    app = FastAPI(title="Issue-to-PR Agent", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Issue-to-PR Agent", version=__version__, lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

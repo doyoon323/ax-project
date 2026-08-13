@@ -1,6 +1,6 @@
 [project]
 name = "issue-to-pr-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "A guarded, three-turn GitHub issue-to-draft-PR agent"
 requires-python = ">=3.11,<3.14"
 dependencies = [
