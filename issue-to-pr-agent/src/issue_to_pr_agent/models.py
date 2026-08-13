@@ -75,4 +75,6 @@ class AgentRunResult:
     estimated_cost_usd: float = 0.0
     correction_cycles: int = 0
     duration_seconds: float = 0.0
+    localization_candidates: list[str] = field(default_factory=list)
+    localization_scanned_files: int = 0
     workspace: Path | None = None

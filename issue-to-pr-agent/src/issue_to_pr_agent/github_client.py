@@ -52,13 +52,16 @@ class GitWorkspaceManager:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.repository_root = settings.workspace_path.resolve(strict=True)
+        source_root = settings.workspace_path.resolve(strict=True)
+        self.repository_root = source_root
         self.worktree_root = settings.worktree_root.resolve(strict=False)
         if self.worktree_root == Path("/") or self.worktree_root.is_relative_to(
             self.repository_root
         ):
             raise GitOperationError("WORKTREE_ROOT must be outside the target repository")
         self._validate_repository()
+        if settings.repository_mirror_path is not None:
+            self._prepare_repository_mirror(source_root, settings.repository_mirror_path)
 
     def prepare(self, issue: IssueTask) -> WorktreeSession:
         delivery_suffix = re.sub(r"[^a-zA-Z0-9]", "", issue.delivery_id)[:8].lower()
@@ -156,6 +159,42 @@ class GitWorkspaceManager:
             return
         if not self._matches_github_origin(origin):
             raise GitOperationError("origin remote does not match GITHUB_REPOSITORY")
+
+    def _prepare_repository_mirror(self, source_root: Path, raw_mirror_path: Path) -> None:
+        mirror_path = raw_mirror_path.resolve(strict=False)
+        if (
+            mirror_path == Path("/")
+            or mirror_path == source_root
+            or mirror_path.is_relative_to(source_root)
+            or self.worktree_root.is_relative_to(mirror_path)
+            or mirror_path.is_relative_to(self.worktree_root)
+        ):
+            raise GitOperationError(
+                "REPOSITORY_MIRROR_PATH must be separate from the source and worktree roots"
+            )
+        source_origin = self._git(["remote", "get-url", "origin"], cwd=source_root)
+        if not mirror_path.exists():
+            mirror_path.parent.mkdir(parents=True, exist_ok=True)
+            completed = subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--no-checkout",
+                    "--no-hardlinks",
+                    str(source_root),
+                    str(mirror_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            if completed.returncode != 0:
+                message = (completed.stderr or completed.stdout).strip()[:500]
+                raise GitOperationError(f"git clone for repository mirror failed: {message}")
+        self.repository_root = mirror_path.resolve(strict=True)
+        self._git(["remote", "set-url", "origin", source_origin])
+        self._validate_repository()
 
     @staticmethod
     def _is_local_origin(origin: str) -> bool:

@@ -103,6 +103,8 @@ def create_app(
         active_processor,
         max_attempts=active_settings.job_max_attempts,
         retry_delay_seconds=active_settings.job_retry_delay_seconds,
+        process_timeout_seconds=active_settings.job_timeout_seconds,
+        shutdown_timeout_seconds=active_settings.worker_shutdown_timeout_seconds,
         status_callback=service.report_status if service is not None else None,
     )
     poller = (

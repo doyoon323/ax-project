@@ -11,6 +11,7 @@ from .github_client import (
     GitWorkspaceManager,
     WorktreeSession,
 )
+from .jobs import JobStore
 from .models import IssueTask
 from .tools import WorkspaceTools
 
@@ -22,6 +23,8 @@ class IssueToPRService:
         self.settings = settings
         self.workspaces = GitWorkspaceManager(settings)
         self.github = GitHubClient(settings)
+        self.usage_store = JobStore(settings.state_db_path)
+        self.usage_store.initialize()
         if settings.publish_enabled:
             self.github.validate_identity()
 
@@ -42,7 +45,24 @@ class IssueToPRService:
                 runner_worktree_root=self.settings.worktree_root,
                 verification_runner_poll_seconds=self.settings.verification_runner_poll_seconds,
             )
-            agent_result = IssueFixAgent(self.settings).run(issue, tools)
+            self.usage_store.enqueue(issue)
+            usage = self.usage_store.usage(issue.delivery_id)
+            agent_result = IssueFixAgent(
+                self.settings,
+                usage_callback=(
+                    lambda prompt, completion, total, cost: self.usage_store.record_usage(
+                        issue.delivery_id,
+                        prompt_tokens=prompt,
+                        completion_tokens=completion,
+                        total_tokens=total,
+                        estimated_cost_usd=cost,
+                    )
+                ),
+                initial_prompt_tokens=usage.prompt_tokens,
+                initial_completion_tokens=usage.completion_tokens,
+                initial_total_tokens=usage.total_tokens,
+                initial_estimated_cost_usd=usage.estimated_cost_usd,
+            ).run(issue, tools)
             run_metadata = {
                 "models": agent_result.model_history,
                 "usage": {
@@ -54,6 +74,10 @@ class IssueToPRService:
                 "correction_cycles": agent_result.correction_cycles,
                 "duration_seconds": agent_result.duration_seconds,
                 "fail_to_pass_proven": bool(agent_result.baseline_verification_results),
+                "localization": {
+                    "candidates": agent_result.localization_candidates,
+                    "scanned_files": agent_result.localization_scanned_files,
+                },
             }
 
             if not agent_result.changed_paths:
@@ -90,22 +114,15 @@ class IssueToPRService:
                 issue.number,
                 agent_result.changed_paths,
             )
-            publish_result = self.github.publish_draft_pr(issue, session.branch, agent_result)
-            check_warning = ""
             if self.settings.github_checks_enabled:
-                try:
-                    self.github.upsert_verification_check(
-                        issue,
-                        self.workspaces.current_head(session),
-                        agent_result,
-                    )
-                except GitHubPublishError:
-                    check_warning = "GitHub Check를 기록하지 못했지만 Draft PR은 생성했습니다."
+                self.github.upsert_verification_check(
+                    issue,
+                    self.workspaces.current_head(session),
+                    agent_result,
+                )
+            publish_result = self.github.publish_draft_pr(issue, session.branch, agent_result)
             succeeded = True
             published = asdict(publish_result)
-            published["warning"] = " ".join(
-                item for item in (publish_result.warning, check_warning) if item
-            )
             return {
                 "status": "published",
                 "changed_files": changed_files,

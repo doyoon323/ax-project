@@ -5,11 +5,12 @@ services:
     command:
       - sh
       - -c
-      - mkdir -p /worktrees /runner-queue/requests /runner-queue/responses /state && chown -R 10001:10001 /worktrees /runner-queue /state
+      - mkdir -p /repository-cache /worktrees /runner-queue/requests /runner-queue/responses /state && chown -R 10001:10001 /repository-cache /worktrees /runner-queue /state
     volumes:
       - worktrees:/worktrees
       - runner-queue:/runner-queue
       - state:/state
+      - repository-cache:/repository-cache
     network_mode: none
     restart: "no"
 
@@ -55,6 +56,7 @@ services:
       VERIFICATION_BACKEND: runner
       VERIFICATION_RUNNER_QUEUE_PATH: /runner-queue
       STATE_DB_PATH: /state/jobs.sqlite3
+      REPOSITORY_MIRROR_PATH: /repository-cache/target
       PUBLISH_ENABLED: ${CONTAINER_PUBLISH_ENABLED:-false}
     depends_on:
       volume-init:
@@ -62,7 +64,8 @@ services:
       runner:
         condition: service_healthy
     volumes:
-      - ${WORKSPACE_PATH:?set WORKSPACE_PATH in .env}:/target-repository
+      - ${WORKSPACE_PATH:?set WORKSPACE_PATH in .env}:/target-repository:ro
+      - repository-cache:/repository-cache
       - worktrees:/worktrees
       - runner-queue:/runner-queue
       - state:/state
@@ -85,3 +88,4 @@ volumes:
   worktrees:
   runner-queue:
   state:
+  repository-cache:

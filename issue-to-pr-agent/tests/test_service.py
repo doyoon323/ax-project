@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 import issue_to_pr_agent.service as service_module
 from issue_to_pr_agent.config import Settings
-from issue_to_pr_agent.github_client import PublishResult, WorktreeSession
+from issue_to_pr_agent.github_client import GitHubPublishError, PublishResult, WorktreeSession
 from issue_to_pr_agent.models import AgentRunResult, CommandResult, IssueTask
 from issue_to_pr_agent.service import IssueToPRService
 
@@ -96,7 +98,7 @@ def build_service(
 
     monkeypatch.setattr(service_module, "GitWorkspaceManager", lambda _: workspaces)
     monkeypatch.setattr(service_module, "GitHubClient", lambda _: github)
-    monkeypatch.setattr(service_module, "IssueFixAgent", lambda _: agent)
+    monkeypatch.setattr(service_module, "IssueFixAgent", lambda *_args, **_kwargs: agent)
     return IssueToPRService(settings), workspaces, github
 
 
@@ -133,4 +135,23 @@ def test_service_publishes_only_after_agent_success(monkeypatch: object, tmp_pat
     workspaces.commit_and_push.assert_called_once()
     github.publish_draft_pr.assert_called_once()
     github.upsert_verification_check.assert_called_once()
+    workspaces.cleanup.assert_called_once()
+
+
+def test_service_requires_github_check_before_draft_pr(monkeypatch: object, tmp_path: Path) -> None:
+    service, workspaces, github = build_service(
+        monkeypatch,
+        make_settings(tmp_path, publish_enabled=True),
+        tmp_path,
+    )
+    github.upsert_verification_check.side_effect = GitHubPublishError(
+        "checks permission denied",
+        status_code=403,
+    )
+
+    with pytest.raises(GitHubPublishError, match="checks permission denied"):
+        service.process(make_issue())
+
+    workspaces.commit_and_push.assert_called_once()
+    github.publish_draft_pr.assert_not_called()
     workspaces.cleanup.assert_called_once()

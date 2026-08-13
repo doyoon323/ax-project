@@ -10,6 +10,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .config import Settings
+from .localization import RepositoryLocalizer
 from .models import AgentDecision, AgentRunResult, CommandResult, IssueTask, Phase
 from .tools import ComplexityLimitError, EditError, ToolPolicyError, WorkspaceTools
 
@@ -91,15 +92,27 @@ class IssueFixAgent:
         *,
         completion_fn: Callable[..., Any] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        usage_callback: Callable[[int, int, int, float], None] | None = None,
+        initial_prompt_tokens: int = 0,
+        initial_completion_tokens: int = 0,
+        initial_total_tokens: int = 0,
+        initial_estimated_cost_usd: float = 0.0,
     ) -> None:
         self.settings = settings
         self._completion = completion_fn or _litellm_completion
         self._sleep = sleep_fn
+        self._usage_callback = usage_callback
+        self._initial_prompt_tokens = initial_prompt_tokens
+        self._initial_completion_tokens = initial_completion_tokens
+        self._initial_total_tokens = initial_total_tokens
+        self._initial_estimated_cost_usd = initial_estimated_cost_usd
         self._active_model = settings.llm_model
         self._model_history: list[str] = []
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
+        self._prompt_tokens = self._initial_prompt_tokens
+        self._completion_tokens = self._initial_completion_tokens
+        self._total_tokens = self._initial_total_tokens
+        self._accumulated_cost_usd = self._initial_estimated_cost_usd
+        self._enforce_usage_budget()
         self._deadline = 0.0
 
     def run(self, issue: IssueTask, tools: WorkspaceTools) -> AgentRunResult:
@@ -108,12 +121,22 @@ class IssueFixAgent:
         tools.set_execution_deadline(self._deadline)
         self._active_model = self.settings.llm_model
         self._model_history = [self._active_model]
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
+        self._prompt_tokens = self._initial_prompt_tokens
+        self._completion_tokens = self._initial_completion_tokens
+        self._total_tokens = self._initial_total_tokens
+        self._accumulated_cost_usd = self._initial_estimated_cost_usd
+        localization = RepositoryLocalizer(
+            tools.root,
+            max_candidates=self.settings.localization_max_files,
+        ).localize(issue)
+        localization_context = localization.render(
+            max_tree_entries=self.settings.localization_tree_entries,
+            max_chars=self.settings.localization_max_context_chars,
+        )
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": self._issue_prompt(issue)},
+            {"role": "user", "content": localization_context},
         ]
         verification_results: list[CommandResult] = []
         final_decision: AgentDecision | None = None
@@ -209,6 +232,8 @@ class IssueFixAgent:
             estimated_cost_usd=self._estimated_cost_usd(),
             correction_cycles=correction_cycles,
             duration_seconds=round(time.monotonic() - started_at, 3),
+            localization_candidates=localization.candidate_paths,
+            localization_scanned_files=localization.scanned_files,
             workspace=tools.root,
         )
 
@@ -475,6 +500,17 @@ class IssueFixAgent:
         self._prompt_tokens += prompt
         self._completion_tokens += completion
         self._total_tokens += total
+        delta_cost = round(
+            prompt * self.settings.model_input_cost_per_million_usd / 1_000_000
+            + completion * self.settings.model_output_cost_per_million_usd / 1_000_000,
+            6,
+        )
+        if self._usage_callback is not None:
+            self._usage_callback(prompt, completion, total, delta_cost)
+        self._accumulated_cost_usd = round(self._accumulated_cost_usd + delta_cost, 6)
+        self._enforce_usage_budget()
+
+    def _enforce_usage_budget(self) -> None:
         if self._total_tokens > self.settings.max_total_tokens_per_job:
             raise AgentBudgetError(
                 f"token budget exceeded: {self._total_tokens} > "
@@ -487,13 +523,7 @@ class IssueFixAgent:
             )
 
     def _estimated_cost_usd(self) -> float:
-        input_cost = (
-            self._prompt_tokens * self.settings.model_input_cost_per_million_usd / 1_000_000
-        )
-        output_cost = (
-            self._completion_tokens * self.settings.model_output_cost_per_million_usd / 1_000_000
-        )
-        return round(input_cost + output_cost, 6)
+        return self._accumulated_cost_usd
 
     def _ensure_within_deadline(self) -> None:
         if self._deadline and time.monotonic() >= self._deadline:

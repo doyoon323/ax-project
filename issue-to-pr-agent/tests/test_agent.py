@@ -133,8 +133,14 @@ def test_fixed_loop_runs_three_phases(tmp_path: Path) -> None:
     assert result.total_tokens == 45
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 15
+    assert result.localization_candidates[0] == "sample.py"
+    assert result.localization_scanned_files == 1
     assert sleeps == [4.1, 4.1, 4.1, 4.1]
     assert [item["num_retries"] for item in completion_arguments] == [0, 0, 0, 0]
+    assert any(
+        "UNTRUSTED_LOCALIZATION_CONTEXT" in message["content"]
+        for message in completion_arguments[0]["messages"]
+    )
 
 
 def test_verified_no_change_returns_success(tmp_path: Path) -> None:
@@ -438,6 +444,27 @@ def test_provider_usage_stops_at_token_budget(tmp_path: Path) -> None:
 
     with pytest.raises(AgentBudgetError, match="token budget exceeded"):
         agent._record_usage(over_budget)
+
+
+def test_provider_usage_enforces_delivery_cumulative_cost(tmp_path: Path) -> None:
+    recorded: list[tuple[int, int, int, float]] = []
+    settings = make_settings(tmp_path).model_copy(update={"max_total_tokens_per_job": 200_000})
+    agent = IssueFixAgent(
+        settings,
+        initial_prompt_tokens=10_000,
+        initial_completion_tokens=39_000,
+        initial_total_tokens=49_000,
+        initial_estimated_cost_usd=0.488,
+        usage_callback=lambda *usage: recorded.append(usage),
+    )
+    response_with_cost = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=0, completion_tokens=1_001, total_tokens=1_001)
+    )
+
+    with pytest.raises(AgentBudgetError, match="estimated cost budget exceeded"):
+        agent._record_usage(response_with_cost)
+
+    assert recorded == [(0, 1_001, 1_001, 0.012012)]
 
 
 def test_fail_to_pass_rejects_test_that_already_passes_on_base(tmp_path: Path) -> None:

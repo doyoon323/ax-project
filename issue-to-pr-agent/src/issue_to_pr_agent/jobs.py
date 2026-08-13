@@ -15,6 +15,14 @@ class RecoveryResult:
     exhausted: list[str]
 
 
+@dataclass(frozen=True)
+class UsageLedger:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
 class JobStore:
     """Small durable queue state used for webhook delivery idempotency."""
 
@@ -35,6 +43,10 @@ class JobStore:
                     result_json TEXT,
                     error TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -47,6 +59,15 @@ class JobStore:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
                 )
+            migrations = {
+                "prompt_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "completion_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "total_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "estimated_cost_usd": "REAL NOT NULL DEFAULT 0",
+            }
+            for name, definition in migrations.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
     def enqueue(self, issue: IssueTask) -> bool:
         payload = json.dumps(asdict(issue), ensure_ascii=False)
@@ -165,6 +186,67 @@ class JobStore:
                 (delivery_id,),
             ).fetchone()
         return str(row[0]) if row else None
+
+    def error(self, delivery_id: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT error FROM jobs WHERE delivery_id = ?",
+                (delivery_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(delivery_id)
+        return str(row[0] or "")
+
+    def record_usage(
+        self,
+        delivery_id: str,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_cost_usd: float,
+    ) -> None:
+        if min(prompt_tokens, completion_tokens, total_tokens) < 0 or estimated_cost_usd < 0:
+            raise ValueError("usage increments cannot be negative")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET prompt_tokens = prompt_tokens + ?,
+                    completion_tokens = completion_tokens + ?,
+                    total_tokens = total_tokens + ?,
+                    estimated_cost_usd = estimated_cost_usd + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE delivery_id = ?
+                """,
+                (
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    estimated_cost_usd,
+                    delivery_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(delivery_id)
+
+    def usage(self, delivery_id: str) -> UsageLedger:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd
+                FROM jobs WHERE delivery_id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(delivery_id)
+        return UsageLedger(
+            prompt_tokens=int(row[0]),
+            completion_tokens=int(row[1]),
+            total_tokens=int(row[2]),
+            estimated_cost_usd=float(row[3]),
+        )
 
     def attempt_count(self, delivery_id: str) -> int:
         with self._connect() as connection:

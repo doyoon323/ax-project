@@ -152,3 +152,29 @@ def test_complexity_limit_and_fail_to_pass_proof(tmp_path: Path) -> None:
 
     assert any(not result.succeeded for result in baseline)
     assert tools.run(["python", "-m", "unittest", "discover", "-s", "tests"], "verify").succeeded
+
+
+def test_fail_to_pass_rejects_import_error_on_baseline(tmp_path: Path) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    (tmp_path / "new_feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (tmp_path / "test_new_feature.py").write_text(
+        "import unittest\n"
+        "from new_feature import VALUE\n\n"
+        "class NewFeatureTest(unittest.TestCase):\n"
+        "    def test_value(self):\n"
+        "        self.assertEqual(VALUE, 2)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ComplexityLimitError, match="import, collection, or configuration"):
+        WorkspaceTools(tmp_path).run_fail_to_pass(
+            [Path("test_new_feature.py")],
+            [["python", "-m", "unittest", "discover"]],
+        )

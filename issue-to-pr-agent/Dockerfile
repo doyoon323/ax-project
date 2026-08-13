@@ -9,9 +9,9 @@ RUN apk add --no-cache git ca-certificates \
     && adduser --disabled-password --uid 10001 agent
 
 WORKDIR /app
-COPY requirements.txt pyproject.toml ./
+COPY requirements.lock ./
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock
 COPY src ./src
-RUN python -m pip install --no-cache-dir .
 COPY docker/git-askpass.sh /usr/local/bin/git-askpass
 RUN chmod 0555 /usr/local/bin/git-askpass
 

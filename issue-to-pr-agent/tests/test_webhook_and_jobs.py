@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import multiprocessing
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -212,17 +213,53 @@ def test_event_filter_and_delivery_idempotency(tmp_path: Path) -> None:
     assert store.status(issue.delivery_id) == "completed"
 
 
+def test_job_store_accumulates_usage_across_attempts(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.initialize()
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Fix a bug",
+        body="Expected behavior",
+        author="octocat",
+        author_association="OWNER",
+    )
+    store.enqueue(issue)
+    store.record_usage(
+        issue.delivery_id,
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+        estimated_cost_usd=0.001,
+    )
+    store.record_usage(
+        issue.delivery_id,
+        prompt_tokens=200,
+        completion_tokens=75,
+        total_tokens=275,
+        estimated_cost_usd=0.002,
+    )
+
+    usage = store.usage(issue.delivery_id)
+
+    assert usage.prompt_tokens == 300
+    assert usage.completion_tokens == 125
+    assert usage.total_tokens == 425
+    assert usage.estimated_cost_usd == pytest.approx(0.003)
+
+
 def test_worker_retries_and_persists_attempt_count(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
-    attempts = 0
+    attempts_path = tmp_path / "attempts.txt"
 
     class TransientFailure(RuntimeError):
         status_code = 503
 
     def flaky_processor(_: IssueTask) -> dict:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
+        attempts = int(attempts_path.read_text() or "0") if attempts_path.exists() else 0
+        attempts_path.write_text(str(attempts + 1), encoding="utf-8")
+        if attempts == 0:
             raise TransientFailure("temporary failure")
         return {"status": "processed"}
 
@@ -245,18 +282,17 @@ def test_worker_retries_and_persists_attempt_count(tmp_path: Path) -> None:
 
     asyncio.run(exercise_worker())
 
-    assert attempts == 2
+    assert attempts_path.read_text(encoding="utf-8") == "2"
     assert store.status(issue.delivery_id) == "completed"
     assert store.attempt_count(issue.delivery_id) == 2
 
 
 def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
-    attempts = 0
+    attempts_path = tmp_path / "attempts.txt"
 
     def invalid_job(_: IssueTask) -> dict:
-        nonlocal attempts
-        attempts += 1
+        attempts_path.write_text("attempted", encoding="utf-8")
         raise ValueError("invalid patch")
 
     issue = IssueTask(
@@ -278,8 +314,93 @@ def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
 
     asyncio.run(exercise_worker())
 
-    assert attempts == 1
+    assert attempts_path.read_text(encoding="utf-8") == "attempted"
     assert store.status(issue.delivery_id) == "failed"
+
+
+def test_worker_hard_timeout_kills_isolated_process(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    pid_path = tmp_path / "worker.pid"
+
+    def hanging_job(_: IssueTask) -> dict:
+        with pid_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{os.getpid()}\n")
+        time.sleep(30)
+        return {"status": "unexpected"}
+
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Hang",
+        body="Never completes",
+        author="octocat",
+        author_association="OWNER",
+    )
+    worker = JobWorker(
+        store,
+        hanging_job,
+        max_attempts=2,
+        retry_delay_seconds=0,
+        process_timeout_seconds=0.2,
+    )
+
+    async def exercise_worker() -> None:
+        await worker.start()
+        await worker.submit(issue)
+        await worker.queue.join()
+        await worker.stop()
+
+    asyncio.run(exercise_worker())
+
+    assert store.status(issue.delivery_id) == "failed"
+    assert store.attempt_count(issue.delivery_id) == 2
+    assert "JobProcessTimeoutError" in store.error(issue.delivery_id)
+    process_ids = [int(item) for item in pid_path.read_text(encoding="utf-8").splitlines()]
+    assert len(process_ids) == 2
+    for process_id in process_ids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_id, 0)
+
+
+def test_worker_shutdown_requeues_interrupted_job(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    started_path = tmp_path / "started"
+
+    def hanging_job(_: IssueTask) -> dict:
+        started_path.touch()
+        time.sleep(30)
+        return {"status": "unexpected"}
+
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Hang",
+        body="Never completes",
+        author="octocat",
+        author_association="OWNER",
+    )
+    worker = JobWorker(
+        store,
+        hanging_job,
+        process_timeout_seconds=30,
+        shutdown_timeout_seconds=0.2,
+    )
+
+    async def exercise_worker() -> None:
+        await worker.start()
+        await worker.submit(issue)
+        for _ in range(100):
+            if started_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert started_path.exists()
+        await worker.stop()
+
+    asyncio.run(exercise_worker())
+
+    assert store.status(issue.delivery_id) == "queued"
 
 
 def test_running_job_is_recovered_within_retry_budget(tmp_path: Path) -> None:

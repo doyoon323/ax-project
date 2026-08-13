@@ -273,10 +273,16 @@ class WorkspaceTools:
         test_paths: list[Path],
         commands: list[list[str]],
     ) -> list[CommandResult]:
-        """Overlay new tests on the base commit and prove at least one gate fails there."""
+        """Run identical targeted tests on patched and base code and reject infra failures."""
 
         if not test_paths:
             raise ComplexityLimitError("fail-to-pass proof requires an edited regression test")
+        targeted_commands = self._targeted_baseline_commands(test_paths, commands)
+        current_results = [self.run(command, "verify") for command in targeted_commands]
+        if any(not result.succeeded for result in current_results):
+            raise ComplexityLimitError(
+                "edited regression tests must pass on the patched code before baseline comparison"
+            )
         archive = subprocess.run(
             ["git", "archive", "--format=tar", "HEAD"],
             cwd=self.root,
@@ -323,8 +329,47 @@ class WorkspaceTools:
                 verification_runner_poll_seconds=self.verification_runner_poll_seconds,
             )
             baseline_tools.execution_deadline = self.execution_deadline
-            targeted_commands = self._targeted_baseline_commands(test_paths, commands)
-            return [baseline_tools.run(command, "verify") for command in targeted_commands]
+            baseline_results = [
+                baseline_tools.run(command, "verify") for command in targeted_commands
+            ]
+            for command, result in zip(targeted_commands, baseline_results, strict=True):
+                self._validate_meaningful_baseline_result(command, result)
+            return baseline_results
+
+    @staticmethod
+    def _validate_meaningful_baseline_result(command: list[str], result: CommandResult) -> None:
+        if result.succeeded:
+            return
+        if result.timed_out or result.return_code != 1:
+            raise ComplexityLimitError(
+                "baseline test failed because of timeout, collection, configuration, or usage error"
+            )
+
+        output = result.output.casefold()
+        infrastructure_markers = (
+            "error collecting",
+            "failed to import test module",
+            "importerror",
+            "modulenotfounderror",
+            "syntaxerror",
+            "no tests ran",
+            "no tests found",
+            "usage error",
+            "internal error",
+        )
+        if any(marker in output for marker in infrastructure_markers):
+            raise ComplexityLimitError(
+                "baseline test failed because of an import, collection, or configuration error"
+            )
+
+        executable = Path(command[0]).name
+        is_unittest = (
+            executable in {"python", "python3"} and command[1:3] == ["-m", "unittest"]
+        ) or (executable == "uv" and command[1:5] == ["run", "python", "-m", "unittest"])
+        if is_unittest and "fail:" not in output and "assertionerror" not in output:
+            raise ComplexityLimitError(
+                "baseline unittest failure was not an assertion failure in the targeted test"
+            )
 
     @staticmethod
     def _targeted_baseline_commands(

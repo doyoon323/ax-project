@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
+import os
+import queue
+import signal
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +17,47 @@ logger = logging.getLogger(__name__)
 StatusCallback = Callable[[IssueTask, str, int, int, str], None]
 
 
+class JobProcessError(RuntimeError):
+    """Failure returned by the isolated job process."""
+
+    def __init__(
+        self,
+        remote_type: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(f"{remote_type}: {message}")
+        self.remote_type = remote_type
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+class JobProcessTimeoutError(JobProcessError):
+    """Raised after the parent kills a job process that exceeded its hard deadline."""
+
+
+def _run_processor_process(
+    processor: Callable[[IssueTask], dict[str, Any]],
+    issue: IssueTask,
+    result_queue: Any,
+) -> None:
+    os.setsid()
+    try:
+        result_queue.put({"ok": True, "result": processor(issue)})
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "type": type(exc).__name__,
+                "message": str(exc)[:1_000],
+                "status_code": getattr(exc, "status_code", None),
+                "retryable": bool(getattr(exc, "retryable", False)),
+            }
+        )
+
+
 class JobWorker:
     """Single-consumer worker so LLM calls and Git worktrees never race locally."""
 
@@ -21,14 +66,18 @@ class JobWorker:
         store: JobStore,
         processor: Callable[[IssueTask], dict[str, Any]],
         *,
-        max_attempts: int = 2,
+        max_attempts: int = 3,
         retry_delay_seconds: float = 10.0,
+        process_timeout_seconds: float = 600.0,
+        shutdown_timeout_seconds: float = 20.0,
         status_callback: StatusCallback | None = None,
     ) -> None:
         self.store = store
         self.processor = processor
         self.max_attempts = max_attempts
         self.retry_delay_seconds = retry_delay_seconds
+        self.process_timeout_seconds = process_timeout_seconds
+        self.shutdown_timeout_seconds = shutdown_timeout_seconds
         self.status_callback = status_callback
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
@@ -51,8 +100,10 @@ class JobWorker:
     async def stop(self) -> None:
         if self._task is None:
             return
-        # Let the active thread and all accepted jobs finish before cancelling the idle consumer.
-        await self.queue.join()
+        try:
+            await asyncio.wait_for(self.queue.join(), timeout=self.shutdown_timeout_seconds)
+        except TimeoutError:
+            logger.warning("Worker shutdown deadline reached; terminating the active job process")
         self._task.cancel()
         try:
             await self._task
@@ -73,7 +124,7 @@ class JobWorker:
                 issue = self.store.get_issue(delivery_id)
                 attempt = self.store.mark_running(delivery_id)
                 await self._notify(issue, "running", attempt, "작업을 시작했습니다.")
-                result = await asyncio.to_thread(self.processor, issue)
+                result = await self._run_in_process(issue)
                 self.store.mark_completed(delivery_id, result)
                 await self._notify(
                     issue,
@@ -83,6 +134,11 @@ class JobWorker:
                 )
                 logger.info("Issue #%s completed with status=%s", issue.number, result["status"])
             except asyncio.CancelledError:
+                if "delivery_id" in locals():
+                    self.store.mark_retry_queued(
+                        delivery_id,
+                        "service shutdown interrupted the isolated job process",
+                    )
                 raise
             except (
                 Exception
@@ -140,8 +196,71 @@ class JobWorker:
         status_code = getattr(exc, "status_code", None)
         return status_code == 429 or status_code in {408, 500, 502, 503, 504}
 
+    async def _run_in_process(self, issue: IssueTask) -> dict[str, Any]:
+        context = multiprocessing.get_context("fork")
+        result_queue = context.Queue(maxsize=1)
+        process = context.Process(
+            target=_run_processor_process,
+            args=(self.processor, issue, result_queue),
+            name=f"issue-agent-{issue.number}",
+        )
+        process.start()
+        deadline = asyncio.get_running_loop().time() + self.process_timeout_seconds
+        try:
+            while process.is_alive():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self._kill_process_group(process)
+                    raise JobProcessTimeoutError(
+                        "JobProcessTimeoutError",
+                        f"job process exceeded {self.process_timeout_seconds}s hard deadline",
+                        retryable=True,
+                    )
+                await asyncio.sleep(0.05)
+            process.join(timeout=1)
+            try:
+                payload = result_queue.get(timeout=1)
+            except queue.Empty as exc:
+                raise JobProcessError(
+                    "JobProcessExitError",
+                    f"job process exited with code {process.exitcode} without a result",
+                ) from exc
+            if payload.get("ok"):
+                result = payload.get("result")
+                if not isinstance(result, dict):
+                    raise JobProcessError(
+                        "InvalidJobResult", "processor result must be a dictionary"
+                    )
+                return result
+            raise JobProcessError(
+                str(payload.get("type") or "RemoteJobError"),
+                str(payload.get("message") or "isolated job process failed"),
+                status_code=payload.get("status_code"),
+                retryable=bool(payload.get("retryable", False)),
+            )
+        except asyncio.CancelledError:
+            self._kill_process_group(process)
+            raise
+        finally:
+            if process.is_alive():
+                self._kill_process_group(process)
+            process.join(timeout=1)
+            result_queue.close()
+
+    @staticmethod
+    def _kill_process_group(process: multiprocessing.Process) -> None:
+        if process.pid is None or not process.is_alive():
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.join(timeout=2)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
     def _failure_detail(self, exc: Exception, attempt: int) -> str:
-        name = type(exc).__name__
+        name = str(getattr(exc, "remote_type", type(exc).__name__))
         if "Timeout" in name:
             reason = "실행 시간 한도를 초과해 중단했습니다."
         elif "Budget" in name:

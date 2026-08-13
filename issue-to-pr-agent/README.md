@@ -7,10 +7,11 @@ GitHub Issue를 받아 소규모 Python 저장소를 수정·검증하고 Draft 
 GitHub Issue(opened/labeled 또는 주기 조회)
   -> 저장소·작성자·ai-fix 라벨 검증
   -> SQLite 중복 방지·재시작 복구 + 단일 로컬 워커
-  -> 임시 Git worktree
+  -> 읽기 전용 원본에서 별도 저장소 mirror + 임시 Git worktree 준비
+  -> 파일 트리·정확 문자열·AST 선언 기반 Top-5 사전 지역화
   -> bounded loop: diagnose -> patch -> verify -> 실패 시 1회 교정
-  -> 수정 전 실패/수정 후 성공 + 서버 소유 격리 검증
-  -> commit/push -> Draft PR -> assignee/comment
+  -> 재현 테스트의 수정 전 유효 실패 + 수정 후 성공 + 전체 회귀 검증
+  -> commit/push -> GitHub Check 성공 -> Draft PR -> assignee/comment
 ```
 
 전체 결정사항과 비범위는 [FINAL_SPEC.md](FINAL_SPEC.md), 검증 수준과 테스트 분해는
@@ -22,12 +23,12 @@ GitHub Issue(opened/labeled 또는 주기 조회)
 - Issue 본문은 신뢰하지 않는 입력으로 취급합니다.
 - Agent는 `shell=True`, 임의 Python 실행, Git 쓰기 명령을 사용할 수 없습니다.
 - `.env`, Git 내부 파일, 인증서·키 파일은 편집하거나 게시하지 않습니다.
-- 원본 checkout 대신 `origin/main`에서 만든 임시 worktree만 수정합니다.
+- Compose에서는 원본 checkout을 읽기 전용으로 마운트하고, 별도 mirror/worktree만 수정합니다.
 - Compose 운영에서는 Agent와 무권한 Runner를 분리합니다. Runner에는 토큰과 네트워크가 없습니다.
 - Runner는 Worktree를 읽기 전용으로 마운트하고 임시 bytecode는 `/tmp`에만 기록합니다.
 - 모델 제안과 별도로 서버가 `git diff --check`와 필수 회귀 테스트를 실행합니다.
 - 게시 전 토큰의 GitHub 로그인과 `GITHUB_EXPECTED_LOGIN`이 일치해야 합니다.
-- 변경사항과 필수 검증 성공이 모두 있어야 Draft PR을 만들 수 있습니다.
+- 변경사항, fail-to-pass, 전체 회귀 테스트와 GitHub Check 기록이 모두 성공해야 Draft PR을 만듭니다.
 - Agent 단계 10분·8파일·800줄·3만 토큰·예상 $0.50을 넘으면 사람 검토로 전환합니다.
 
 이 안전장치는 컨테이너/VM 샌드박스를 대체하지 않습니다. 공개 저장소에서 불특정 사용자의
@@ -35,7 +36,8 @@ Issue를 처리하는 용도로는 아직 적합하지 않습니다.
 
 ## 설치
 
-Python 3.11~3.13을 사용합니다. 격리 검증 이미지는 실행 전에 준비합니다.
+Python 3.11~3.13을 사용합니다. Agent 컨테이너의 런타임 의존성은 hash가 포함된
+`requirements.lock`으로 고정하며, 격리 검증 이미지는 실행 전에 준비합니다.
 
 ```bash
 cd issue-to-pr-agent
@@ -109,10 +111,11 @@ capability 제거, read-only root, CPU·메모리·PID 제한을 사용하며 AP
 보고한 토큰 수는 SQLite 결과와 Draft PR에 남습니다. `LLM_FALLBACK_MODEL`을 설정한 경우에만
 429 또는 5xx 뒤 예비 모델로 전환하며, 인증·요청 형식 오류에는 전환하지 않습니다.
 
-작업 실패는 429·5xx·네트워크 오류에 한해 최대 2회 재시도합니다. 테스트 실패는 관찰 결과로
-1회만 수정·재검증합니다. 중단된 `running` 작업은 SQLite 시도 횟수로 복구하고, push 뒤 API가
-실패해도 Agent 전용 브랜치를 lease 조건으로 갱신해 재개합니다. 최종 실패 뒤 제목·본문을
-보완하면 새 revision으로 재접수됩니다. 게시 모드에서는 Issue 상태 댓글과 PR Check를 남깁니다.
+429·5xx·네트워크 오류와 OS 프로세스 hard timeout만 최대 3회 시도합니다. 비용과 토큰은
+delivery 전체 시도에 걸쳐 SQLite에 누적하므로 재시도로 상한을 우회할 수 없습니다. 테스트 실패는
+관찰 결과로 1회만 수정·재검증합니다. 서비스 종료 중인 작업은 `queued`로 복구하며, 정지한
+프로세스 그룹은 강제 종료합니다. 최종 실패 뒤 제목·본문을 보완하면 새 revision으로 재접수됩니다.
+게시 모드에서는 Issue 상태 댓글과 검증 Check를 남깁니다.
 
 ## 선택: Webhook 모드
 
@@ -149,11 +152,11 @@ GitHub 저장소의 `Settings -> Webhooks -> Add webhook`에서 설정합니다.
 
 ## 발표 시 명확히 밝힐 남은 위험
 
-1. 실제 GitHub Issue→Gemini→Draft PR 전체 흐름은 토큰·비용·외부 변경이 있어 별도 E2E가 필요합니다.
-2. Runner는 의존성을 자동 설치하지 않으며 저장소별 잠금 이미지와 digest 고정이 필요합니다.
-3. SQLite 단일 Worker라 다중 인스턴스, 분산 lease, 수평 확장은 지원하지 않습니다.
-4. 비용 한도는 시도별입니다. 게시 단계 재시도까지 합친 누적 비용 원장은 아직 없습니다.
-5. fail-to-pass도 LLM이 만든 테스트의 요구사항 해석 자체가 틀리면 의미 정확성을 보장하지 못합니다.
-6. 일반 Docker 격리이므로 공개 저장소에는 gVisor·VM 같은 더 강한 샌드박스가 필요합니다.
-7. GitHub Check를 Required Check로 강제하는 Branch Protection은 저장소에서 별도 설정해야 합니다.
-8. Gemini 3.1 Pro는 Preview이며 모델 종료·가격 변경 시 운영 설정을 갱신해야 합니다.
+1. 강화된 현재 코드의 GitHub Issue→유료 Gemini→Draft PR 외부 E2E는 아직 실행하지 않았습니다.
+2. 정확 문자열·AST 기반 지역화의 Recall@5와 실제 Issue 해결률은 표본 acceptance issue로 측정해야 합니다.
+3. LLM이 만든 재현 테스트가 사용자의 의미 요구사항과 일치하는지는 자동으로 완전히 보장하지 못합니다.
+4. Runner는 대상 저장소 의존성을 자동 설치하지 않아 저장소별 잠금 이미지와 digest가 필요합니다.
+5. Agent 컨테이너는 네트워크·토큰·쓰기 가능한 mirror를 함께 가지므로 침해 시 단일 실패점입니다.
+6. SQLite 단일 Worker라 다중 인스턴스, 분산 lease와 수평 확장은 지원하지 않습니다.
+7. 일반 Docker 격리이므로 공개 저장소에는 gVisor·VM 같은 더 강한 샌드박스가 필요합니다.
+8. Check의 Required 정책과 Preview 모델의 수명·가격은 GitHub/Google 외부 설정에 의존합니다.

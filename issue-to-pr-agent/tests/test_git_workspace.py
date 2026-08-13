@@ -49,6 +49,7 @@ def test_worktree_publishes_edits_and_recovers_existing_remote_branch(tmp_path: 
         state_db_path=tmp_path / "jobs.sqlite3",
         fetch_before_run=False,
         allow_local_git_origin=True,
+        repository_mirror_path=tmp_path / "repository-mirror",
     )
     issue = IssueTask(
         delivery_id="abcdef12-3456",
@@ -60,6 +61,8 @@ def test_worktree_publishes_edits_and_recovers_existing_remote_branch(tmp_path: 
         author_association="OWNER",
     )
     manager = GitWorkspaceManager(settings)
+    assert manager.repository_root == (tmp_path / "repository-mirror").resolve()
+    assert git(target, "status", "--porcelain") == ""
     assert manager._matches_github_origin("https://github.com/owner/repository.git")
     assert manager._matches_github_origin("git@github.com:owner/repository.git")
     assert not manager._matches_github_origin("https://attacker.example/owner/repository.git")

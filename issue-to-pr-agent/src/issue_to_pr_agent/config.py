@@ -56,11 +56,16 @@ class Settings(BaseSettings):
     allow_host_verification: bool = False
     verification_timeout_seconds: int = 120
     job_timeout_seconds: int = 600
+    worker_shutdown_timeout_seconds: float = 20.0
     max_changed_files: int = 8
     max_diff_lines: int = 800
+    localization_max_files: int = 5
+    localization_tree_entries: int = 200
+    localization_max_context_chars: int = 12_000
     keep_failed_worktree: bool = False
-    job_max_attempts: int = 2
+    job_max_attempts: int = 3
     job_retry_delay_seconds: float = 10.0
+    repository_mirror_path: Path | None = None
     worktree_root: Path = Path("/tmp/issue-to-pr-agent/worktrees")
     state_db_path: Path = Path(".state/jobs.sqlite3")
     command_timeout_seconds: int = 30
@@ -144,6 +149,13 @@ class Settings(BaseSettings):
             raise ValueError("JOB_TIMEOUT_SECONDS must be between 60 and 3600")
         return value
 
+    @field_validator("worker_shutdown_timeout_seconds")
+    @classmethod
+    def bound_worker_shutdown_timeout(cls, value: float) -> float:
+        if not 1 <= value <= 300:
+            raise ValueError("WORKER_SHUTDOWN_TIMEOUT_SECONDS must be between 1 and 300")
+        return value
+
     @field_validator("max_changed_files")
     @classmethod
     def bound_changed_files(cls, value: int) -> int:
@@ -156,6 +168,27 @@ class Settings(BaseSettings):
     def bound_diff_lines(cls, value: int) -> int:
         if not 20 <= value <= 10_000:
             raise ValueError("MAX_DIFF_LINES must be between 20 and 10000")
+        return value
+
+    @field_validator("localization_max_files")
+    @classmethod
+    def bound_localization_files(cls, value: int) -> int:
+        if not 1 <= value <= 10:
+            raise ValueError("LOCALIZATION_MAX_FILES must be between 1 and 10")
+        return value
+
+    @field_validator("localization_tree_entries")
+    @classmethod
+    def bound_localization_tree(cls, value: int) -> int:
+        if not 20 <= value <= 1_000:
+            raise ValueError("LOCALIZATION_TREE_ENTRIES must be between 20 and 1000")
+        return value
+
+    @field_validator("localization_max_context_chars")
+    @classmethod
+    def bound_localization_context(cls, value: int) -> int:
+        if not 2_000 <= value <= 30_000:
+            raise ValueError("LOCALIZATION_MAX_CONTEXT_CHARS must be between 2000 and 30000")
         return value
 
     @field_validator("job_max_attempts")
