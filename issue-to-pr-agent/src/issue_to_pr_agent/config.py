@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     llm_fallback_model: str | None = None
     llm_api_base: str | None = None
     llm_retries: int = 2
-    llm_max_output_tokens: int = 4_096
+    llm_max_output_tokens: int = 8_192
     max_total_tokens_per_job: int = 30_000
     max_estimated_cost_usd: float = 0.50
     model_input_cost_per_million_usd: float = 2.0

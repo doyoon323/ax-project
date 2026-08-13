@@ -9,6 +9,7 @@ import signal
 from collections.abc import Callable
 from typing import Any
 
+from .issue_validation import validate_issue_actionability
 from .jobs import JobStore
 from .models import IssueTask
 
@@ -123,6 +124,7 @@ class JobWorker:
             try:
                 issue = self.store.get_issue(delivery_id)
                 attempt = self.store.mark_running(delivery_id)
+                validate_issue_actionability(issue)
                 await self._notify(issue, "running", attempt, "작업을 시작했습니다.")
                 result = await self._run_in_process(issue)
                 self.store.mark_completed(delivery_id, result)
@@ -272,7 +274,13 @@ class JobWorker:
     def _failure_detail(self, exc: Exception, attempt: int) -> str:
         name = str(getattr(exc, "remote_type", type(exc).__name__))
         message = str(exc).casefold()
-        if "edited tests also pass against the base commit" in message:
+        if "IssueInputError" in name:
+            reason = str(exc).split(": ", 1)[-1]
+        elif "invalid structured response" in message:
+            reason = "모델이 해당 단계의 구조화 응답 형식을 만들지 못해 자동 게시를 중단했습니다."
+        elif "verify turn did not explicitly finish" in message:
+            reason = "모델이 최종 검증 완료 신호를 만들지 못해 자동 게시를 중단했습니다."
+        elif "edited tests also pass against the base commit" in message:
             reason = (
                 "추가한 테스트가 수정 전 코드에서도 통과해 Issue의 요구사항을 "
                 "증명하지 못했습니다. 기대 동작과 인수 조건을 구체적으로 작성해 주세요."

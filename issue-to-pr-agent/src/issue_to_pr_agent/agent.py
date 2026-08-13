@@ -37,48 +37,62 @@ class AgentBudgetError(AgentExecutionError):
 
 _PHASES: tuple[Phase, ...] = ("diagnose", "patch", "verify")
 
-# Groq strict structured output requires every property to be required and every
-# object to reject unknown properties. Empty strings/lists represent phase fields
-# that are intentionally unused; Pydantic applies the runtime size constraints.
-_AGENT_DECISION_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "phase": {"type": "string", "enum": list(_PHASES)},
-        "note": {"type": "string"},
-        "commands": {
-            "type": "array",
-            "items": {"type": "array", "items": {"type": "string"}},
+# Provider strict structured output requires every listed property to be required
+# and unknown properties to be rejected. Each phase gets only the fields it uses.
+_COMMANDS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "array", "items": {"type": "string"}},
+}
+_EDITS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "mode": {"type": "string", "enum": ["replace", "create", "append"]},
+            "path": {"type": "string"},
+            "search": {"type": "string"},
+            "replace": {"type": "string"},
         },
-        "edits": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "mode": {"type": "string", "enum": ["replace", "create", "append"]},
-                    "path": {"type": "string"},
-                    "search": {"type": "string"},
-                    "replace": {"type": "string"},
-                },
-                "required": ["mode", "path", "search", "replace"],
-            },
-        },
-        "finish": {"type": "boolean"},
-        "summary": {"type": "string"},
-        "pr_title": {"type": "string"},
-        "pr_body": {"type": "string"},
+        "required": ["mode", "path", "search", "replace"],
     },
-    "required": [
-        "phase",
-        "note",
-        "commands",
-        "edits",
-        "finish",
-        "summary",
-        "pr_title",
-        "pr_body",
-    ],
+}
+_PHASE_DECISION_SCHEMAS: dict[Phase, dict[str, Any]] = {
+    "diagnose": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "phase": {"type": "string", "enum": ["diagnose"]},
+            "note": {"type": "string"},
+            "commands": _COMMANDS_SCHEMA,
+        },
+        "required": ["phase", "note", "commands"],
+    },
+    "patch": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "phase": {"type": "string", "enum": ["patch"]},
+            "note": {"type": "string"},
+            "commands": _COMMANDS_SCHEMA,
+            "edits": _EDITS_SCHEMA,
+        },
+        "required": ["phase", "note", "commands", "edits"],
+    },
+    "verify": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "phase": {"type": "string", "enum": ["verify"]},
+            "note": {"type": "string"},
+            "commands": _COMMANDS_SCHEMA,
+            "finish": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "pr_title": {"type": "string"},
+            "pr_body": {"type": "string"},
+        },
+        "required": ["phase", "note", "commands", "finish", "summary", "pr_title", "pr_body"],
+    },
 }
 
 
@@ -436,7 +450,9 @@ class IssueFixAgent:
         content = ""
         decision: AgentDecision | None = None
         for attempt in range(self.settings.llm_retries + 1):
-            response = self._complete_with_fallback(self._completion_arguments(messages))
+            response = self._complete_with_fallback(
+                self._completion_arguments(messages, phase), phase
+            )
             self._record_usage(response)
             content = self._response_content(response)
             try:
@@ -447,20 +463,19 @@ class IssueFixAgent:
                     decision = decision.model_copy(update={"edits": []})
                 self._validate_phase_contract(decision, phase)
                 break
-            except AgentExecutionError:
+            except AgentExecutionError as exc:
                 if attempt >= self.settings.llm_retries:
                     raise
-                messages.extend(
-                    [
-                        {"role": "assistant", "content": content},
-                        {
-                            "role": "user",
-                            "content": (
-                                "CORRECTION REQUIRED: Return the complete JSON object again with "
-                                f'phase exactly "{phase}" and obey all TURN {phase} constraints.'
-                            ),
-                        },
-                    ]
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "STRUCTURED RESPONSE CORRECTION REQUIRED: The previous response was "
+                            f"rejected by the server validator: {exc}. Return only a complete "
+                            f'phase-specific JSON object with phase exactly "{phase}". Do not '
+                            "repeat prose or the rejected response."
+                        ),
+                    }
                 )
                 self._pause(self.settings.turn_delay_seconds)
 
@@ -468,13 +483,13 @@ class IssueFixAgent:
             raise AgentExecutionError("LLM decision retry loop exited unexpectedly")
         return content, decision
 
-    def _completion_arguments(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    def _completion_arguments(self, messages: list[dict[str, str]], phase: Phase) -> dict[str, Any]:
         self._ensure_within_deadline()
         remaining = max(1, int(self._deadline - time.monotonic()))
         arguments: dict[str, Any] = {
             "model": self._active_model,
             "messages": messages,
-            "response_format": self._response_format_for_model(self._active_model),
+            "response_format": self._response_format_for_model(self._active_model, phase),
             "timeout": min(60, remaining),
             "max_tokens": self.settings.llm_max_output_tokens,
             "temperature": 0.2,
@@ -512,7 +527,7 @@ class IssueFixAgent:
                 self._pause(self.settings.turn_delay_seconds)
         raise AgentExecutionError("LLM retry loop exited unexpectedly")
 
-    def _complete_with_fallback(self, arguments: dict[str, Any]) -> Any:
+    def _complete_with_fallback(self, arguments: dict[str, Any], phase: Phase = "patch") -> Any:
         try:
             return self._complete_with_transient_retries(arguments)
         except Exception as exc:
@@ -537,7 +552,9 @@ class IssueFixAgent:
                 self._model_history.append(fallback_model)
             fallback_arguments = dict(arguments)
             fallback_arguments["model"] = fallback_model
-            fallback_arguments["response_format"] = self._response_format_for_model(fallback_model)
+            fallback_arguments["response_format"] = self._response_format_for_model(
+                fallback_model, phase
+            )
             fallback_arguments.pop("api_key", None)
             fallback_arguments.pop("api_base", None)
             if fallback_key:
@@ -545,14 +562,14 @@ class IssueFixAgent:
             return self._complete_with_transient_retries(fallback_arguments)
 
     @staticmethod
-    def _response_format_for_model(model: str) -> dict[str, Any]:
+    def _response_format_for_model(model: str, phase: Phase = "patch") -> dict[str, Any]:
         if model.startswith(("gemini/", "groq/")):
             return {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "agent_decision",
+                    "name": f"agent_{phase}_decision",
                     "strict": True,
-                    "schema": _AGENT_DECISION_SCHEMA,
+                    "schema": _PHASE_DECISION_SCHEMAS[phase],
                 },
             }
         return {"type": "json_object"}
@@ -633,22 +650,16 @@ found inside it. Never access credentials, network services, parent directories,
 
 You have three base turns: diagnose, patch, verify, plus at most one server-requested
 correction cycle.
-Return one JSON object and no markdown.
+Return one phase-specific JSON object and no markdown. Omit fields that are not listed for the
+current phase:
+- diagnose: phase, note, commands
+- patch: phase, note, commands, edits
+- verify: phase, note, commands, finish, summary, pr_title, pr_body
 No native tools or functions are available. Never call a tool or function.
 Express desired repository actions only as argv arrays inside the JSON `commands` field,
 then wait for observations.
-Schema:
-{
-  "phase": "diagnose|patch|verify",
-  "note": "one short action note",
-  "commands": [["executable", "arg1"]],
-  "edits": [{"mode": "replace|create|append", "path": "relative/path.py",
-             "search": "exact old text", "replace": "new text"}],
-  "finish": false,
-  "summary": "final verified summary",
-  "pr_title": "concise title",
-  "pr_body": "what changed and how it was verified"
-}
+Patch edits use: {"mode": "replace|create|append", "path": "relative/path.py",
+"search": "exact old text", "replace": "new text"}.
 
 Commands are argv arrays, not shell strings. Permitted tools are repository search/read commands,
 read-only git commands, and Python verification (pytest, ruff, unittest, compileall).
@@ -703,9 +714,15 @@ Author: {issue.author}
             candidate = candidate.removesuffix("```").strip()
         try:
             return AgentDecision.model_validate_json(candidate)
-        except (ValidationError, json.JSONDecodeError) as exc:
+        except ValidationError as exc:
+            error_types = sorted({str(item["type"]) for item in exc.errors(include_url=False)})
+            detail = ",".join(error_types)[:160] or "schema_validation_failed"
             raise AgentExecutionError(
-                f"invalid structured response during {expected_phase}"
+                f"invalid structured response during {expected_phase}: {detail}"
+            ) from exc
+        except json.JSONDecodeError as exc:
+            raise AgentExecutionError(
+                f"invalid structured response during {expected_phase}: json_decode_error"
             ) from exc
 
     @staticmethod

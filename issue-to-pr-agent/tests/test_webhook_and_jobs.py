@@ -139,7 +139,10 @@ def test_github_verification_check_is_created_idempotently(tmp_path: Path) -> No
         repository="owner/repository",
         number=42,
         title="Fix a bug",
-        body="Expected behavior",
+        body=(
+            "Update sample.py so the returned value is two, and add a unit test that verifies "
+            "the new behavior."
+        ),
         author="octocat",
         author_association="OWNER",
     )
@@ -178,7 +181,10 @@ def issue_payload() -> dict:
         "issue": {
             "number": 42,
             "title": "Fix a bug",
-            "body": "Expected behavior",
+            "body": (
+                "Update sample.py so the returned value is two, and add a unit test that "
+                "verifies the new behavior."
+            ),
             "author_association": "OWNER",
             "user": {"login": "octocat"},
             "labels": [{"name": "ai-fix"}],
@@ -221,7 +227,10 @@ def test_job_store_accumulates_usage_across_attempts(tmp_path: Path) -> None:
         repository="owner/repository",
         number=42,
         title="Fix a bug",
-        body="Expected behavior",
+        body=(
+            "Update sample.py so the returned value is two, and add a unit test that verifies "
+            "the new behavior."
+        ),
         author="octocat",
         author_association="OWNER",
     )
@@ -268,7 +277,10 @@ def test_worker_retries_and_persists_attempt_count(tmp_path: Path) -> None:
         repository="owner/repository",
         number=42,
         title="Fix a bug",
-        body="Expected behavior",
+        body=(
+            "Update sample.py so the returned value is two, and add a unit test that verifies "
+            "the new behavior."
+        ),
         author="octocat",
         author_association="OWNER",
     )
@@ -301,7 +313,10 @@ def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
         repository="owner/repository",
         number=42,
         title="Fix a bug",
-        body="Expected behavior",
+        body=(
+            "Update sample.py so the returned value is two, and add a unit test that verifies "
+            "the new behavior."
+        ),
         author="octocat",
         author_association="OWNER",
     )
@@ -327,6 +342,48 @@ def test_worker_does_not_retry_deterministic_failure(tmp_path: Path) -> None:
     assert store.status(issue.delivery_id) == "failed"
     assert status_updates[-1][:3] == ("failed", 1, 1)
     assert "자동 재시도하지 않습니다" in status_updates[-1][3]
+
+
+def test_worker_rejects_unactionable_issue_without_calling_processor(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    processor_called = False
+    status_updates: list[tuple[str, int, int, str]] = []
+
+    def processor(_: IssueTask) -> dict:
+        nonlocal processor_called
+        processor_called = True
+        return {"status": "unexpected"}
+
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=11,
+        title="fleat: 기능 추가",
+        body="ㅂㅈㅇㅁㄹㄴㅇㄹ1",
+        author="octocat",
+        author_association="OWNER",
+    )
+    worker = JobWorker(
+        store,
+        processor,
+        status_callback=lambda _, status, attempt, maximum, detail: status_updates.append(
+            (status, attempt, maximum, detail)
+        ),
+    )
+
+    async def exercise_worker() -> None:
+        await worker.start()
+        await worker.submit(issue)
+        await worker.queue.join()
+        await worker.stop()
+
+    asyncio.run(exercise_worker())
+
+    assert processor_called is False
+    assert store.status(issue.delivery_id) == "failed"
+    assert store.usage(issue.delivery_id).total_tokens == 0
+    assert status_updates[-1][:3] == ("failed", 1, 1)
+    assert "LLM을 호출하지 않았습니다" in status_updates[-1][3]
 
 
 def test_worker_explains_unproven_fail_to_pass() -> None:
@@ -358,7 +415,10 @@ def test_worker_hard_timeout_kills_isolated_process(tmp_path: Path) -> None:
         repository="owner/repository",
         number=42,
         title="Hang",
-        body="Never completes",
+        body=(
+            "Run a deliberately hanging processor and verify that the worker stops it after the "
+            "configured timeout."
+        ),
         author="octocat",
         author_association="OWNER",
     )
@@ -402,7 +462,10 @@ def test_worker_shutdown_requeues_interrupted_job(tmp_path: Path) -> None:
         repository="owner/repository",
         number=42,
         title="Hang",
-        body="Never completes",
+        body=(
+            "Run a deliberately hanging processor and verify that shutdown safely requeues the "
+            "interrupted job."
+        ),
         author="octocat",
         author_association="OWNER",
     )

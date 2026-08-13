@@ -111,6 +111,8 @@ capability 제거, read-only root, CPU·메모리·PID 제한을 사용하며 AP
 
 `ISSUE_SOURCE=poll`은 로컬 데모용입니다. 별도 공개 URL 없이 15초마다 열린 Issue를 조회합니다. `ai-fix` 라벨이
 있고 작성자 관계가 `OWNER`, `MEMBER`, `COLLABORATOR`인 Issue만 한 번씩 큐에 넣습니다.
+Issue 본문이 공백 제외 40자 미만이거나 단어가 지나치게 적거나 자판 입력 형태이면 LLM 호출 전에
+`1/1` 실패로 종료합니다. 본문에는 수정 대상, 기대 동작, 확인 조건이 있어야 합니다.
 Patch 단계에서 실제 파일 변경이 없으면 성공으로 보고하지 않고 사람 검토가 필요한 실패로 종료합니다.
 따라서 모델의 설명만으로 `no-change` 완료나 Draft PR 생략을 정당화할 수 없습니다.
 신규 공개 API의 테스트가 기준 코드에서 import 오류를 내면 해당 테스트만 한 번 보정해, 기준

@@ -244,15 +244,33 @@ def test_rate_limit_switches_to_sticky_groq_fallback(tmp_path: Path) -> None:
     ]
 
 
-def test_groq_schema_requires_all_fields_and_rejects_unknown_properties() -> None:
-    response_format = IssueFixAgent._response_format_for_model("groq/openai/gpt-oss-120b")
+def test_phase_schemas_include_only_required_fields() -> None:
+    response_format = IssueFixAgent._response_format_for_model("groq/openai/gpt-oss-120b", "patch")
     schema = response_format["json_schema"]["schema"]
 
     assert response_format["type"] == "json_schema"
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])
+    assert set(schema["properties"]) == {"phase", "note", "commands", "edits"}
     assert schema["properties"]["edits"]["items"]["additionalProperties"] is False
     assert "mode" in schema["properties"]["edits"]["items"]["required"]
+
+    diagnose = IssueFixAgent._response_format_for_model("gemini/gemini-flash-latest", "diagnose")[
+        "json_schema"
+    ]["schema"]
+    verify = IssueFixAgent._response_format_for_model("gemini/gemini-flash-latest", "verify")[
+        "json_schema"
+    ]["schema"]
+    assert set(diagnose["properties"]) == {"phase", "note", "commands"}
+    assert set(verify["properties"]) == {
+        "phase",
+        "note",
+        "commands",
+        "finish",
+        "summary",
+        "pr_title",
+        "pr_body",
+    }
 
 
 def test_system_prompt_disables_provider_native_and_shell_tools() -> None:
@@ -361,6 +379,10 @@ def test_wrong_phase_is_corrected_before_tools_run(tmp_path: Path) -> None:
     assert decision.phase == "diagnose"
     assert len(calls) == 2
     assert any("CORRECTION REQUIRED" in message["content"] for message in calls[1]["messages"])
+    assert not any(
+        message["role"] == "assistant" and "Wrong phase label" in message["content"]
+        for message in calls[1]["messages"]
+    )
 
 
 def test_failed_gate_gets_one_bounded_correction_cycle(tmp_path: Path) -> None:
