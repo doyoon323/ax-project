@@ -175,3 +175,36 @@ def test_service_requires_github_check_before_draft_pr(monkeypatch: object, tmp_
     workspaces.commit_and_push.assert_called_once()
     github.publish_draft_pr.assert_not_called()
     workspaces.cleanup.assert_called_once()
+
+
+def test_service_resumes_publication_without_rerunning_agent(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    service, workspaces, github = build_service(
+        monkeypatch,
+        make_settings(tmp_path, publish_enabled=True),
+        tmp_path,
+    )
+    github.publish_draft_pr.side_effect = [
+        GitHubPublishError("temporary ssl failure", retryable=True),
+        PublishResult(
+            pr_number=7,
+            pr_url="https://github.com/owner/repository/pull/7",
+            assignee_added=True,
+        ),
+    ]
+    issue = make_issue()
+
+    with pytest.raises(GitHubPublishError, match="temporary ssl failure"):
+        service.process(issue)
+
+    checkpoint = service.usage_store.checkpoint(issue.delivery_id)
+    assert checkpoint is not None
+    assert checkpoint["kind"] == "publication-pending"
+
+    result = service.process(issue)
+
+    assert result["status"] == "published"
+    assert workspaces.prepare.call_count == 1
+    assert workspaces.commit_and_push.call_count == 1
+    assert github.publish_draft_pr.call_count == 2

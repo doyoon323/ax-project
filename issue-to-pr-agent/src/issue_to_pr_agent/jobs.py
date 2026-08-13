@@ -168,6 +168,36 @@ class JobStore:
                 (json.dumps(result, ensure_ascii=False), delivery_id),
             )
 
+    def save_checkpoint(self, delivery_id: str, checkpoint: dict[str, Any]) -> None:
+        """Persist resumable work before an external publication boundary."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE jobs
+                SET result_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE delivery_id = ?
+                """,
+                (json.dumps(checkpoint, ensure_ascii=False), delivery_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(delivery_id)
+
+    def checkpoint(self, delivery_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM jobs WHERE delivery_id = ?",
+                (delivery_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(delivery_id)
+        if row[0] is None:
+            return None
+        value = json.loads(str(row[0]))
+        if not isinstance(value, dict):
+            raise ValueError("job checkpoint must be a JSON object")
+        return value
+
     def mark_failed(self, delivery_id: str, error: str) -> None:
         with self._connect() as connection:
             connection.execute(

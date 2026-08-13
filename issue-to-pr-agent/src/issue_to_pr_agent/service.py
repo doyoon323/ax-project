@@ -11,7 +11,7 @@ from .github_client import (
     WorktreeSession,
 )
 from .jobs import JobStore
-from .models import IssueTask
+from .models import AgentRunResult, CommandResult, IssueTask
 from .tools import WorkspaceTools
 
 
@@ -31,6 +31,11 @@ class IssueToPRService:
         session: WorktreeSession | None = None
         succeeded = False
         try:
+            self.usage_store.enqueue(issue)
+            checkpoint = self.usage_store.checkpoint(issue.delivery_id)
+            if checkpoint is not None and checkpoint.get("kind") == "publication-pending":
+                return self._resume_publication(issue, checkpoint)
+
             session = self.workspaces.prepare(issue)
             tools = WorkspaceTools(
                 session.path,
@@ -44,7 +49,6 @@ class IssueToPRService:
                 runner_worktree_root=self.settings.worktree_root,
                 verification_runner_poll_seconds=self.settings.verification_runner_poll_seconds,
             )
-            self.usage_store.enqueue(issue)
             usage = self.usage_store.usage(issue.delivery_id)
             agent_result = IssueFixAgent(
                 self.settings,
@@ -62,22 +66,7 @@ class IssueToPRService:
                 initial_total_tokens=usage.total_tokens,
                 initial_estimated_cost_usd=usage.estimated_cost_usd,
             ).run(issue, tools)
-            run_metadata = {
-                "models": agent_result.model_history,
-                "usage": {
-                    "prompt_tokens": agent_result.prompt_tokens,
-                    "completion_tokens": agent_result.completion_tokens,
-                    "total_tokens": agent_result.total_tokens,
-                },
-                "estimated_cost_usd": agent_result.estimated_cost_usd,
-                "correction_cycles": agent_result.correction_cycles,
-                "duration_seconds": agent_result.duration_seconds,
-                "fail_to_pass_proven": bool(agent_result.baseline_verification_results),
-                "localization": {
-                    "candidates": agent_result.localization_candidates,
-                    "scanned_files": agent_result.localization_scanned_files,
-                },
-            }
+            run_metadata = self._run_metadata(agent_result)
 
             if not agent_result.changed_paths:
                 raise AgentExecutionError(
@@ -100,24 +89,86 @@ class IssueToPRService:
                 issue.number,
                 agent_result.changed_paths,
             )
-            if self.settings.github_checks_enabled:
-                self.github.upsert_verification_check(
-                    issue,
-                    self.workspaces.current_head(session),
-                    agent_result,
-                )
-            publish_result = self.github.publish_draft_pr(issue, session.branch, agent_result)
-            succeeded = True
-            published = asdict(publish_result)
-            return {
-                "status": "published",
+            checkpoint = {
+                "kind": "publication-pending",
+                "branch": session.branch,
+                "head_sha": self.workspaces.current_head(session),
                 "changed_files": changed_files,
-                **run_metadata,
-                **published,
+                "agent_result": self._serialize_agent_result(agent_result),
             }
+            self.usage_store.save_checkpoint(issue.delivery_id, checkpoint)
+            result = self._resume_publication(issue, checkpoint)
+            succeeded = True
+            return result
         finally:
             if session is not None and (succeeded or not self.settings.keep_failed_worktree):
                 self.workspaces.cleanup(session)
+
+    def _resume_publication(self, issue: IssueTask, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        branch = checkpoint.get("branch")
+        head_sha = checkpoint.get("head_sha")
+        changed_files = checkpoint.get("changed_files")
+        raw_agent_result = checkpoint.get("agent_result")
+        if not (
+            isinstance(branch, str)
+            and isinstance(head_sha, str)
+            and isinstance(changed_files, list)
+            and all(isinstance(path, str) for path in changed_files)
+            and isinstance(raw_agent_result, dict)
+        ):
+            raise AgentExecutionError("publication checkpoint is invalid")
+        agent_result = self._deserialize_agent_result(raw_agent_result)
+        if self.settings.github_checks_enabled:
+            self.github.upsert_verification_check(issue, head_sha, agent_result)
+        publish_result = self.github.publish_draft_pr(issue, branch, agent_result)
+        return {
+            "status": "published",
+            "changed_files": changed_files,
+            **self._run_metadata(agent_result),
+            **asdict(publish_result),
+        }
+
+    @staticmethod
+    def _run_metadata(agent_result: AgentRunResult) -> dict[str, Any]:
+        return {
+            "models": agent_result.model_history,
+            "usage": {
+                "prompt_tokens": agent_result.prompt_tokens,
+                "completion_tokens": agent_result.completion_tokens,
+                "total_tokens": agent_result.total_tokens,
+            },
+            "estimated_cost_usd": agent_result.estimated_cost_usd,
+            "correction_cycles": agent_result.correction_cycles,
+            "duration_seconds": agent_result.duration_seconds,
+            "fail_to_pass_proven": bool(agent_result.baseline_verification_results),
+            "localization": {
+                "candidates": agent_result.localization_candidates,
+                "scanned_files": agent_result.localization_scanned_files,
+            },
+        }
+
+    @staticmethod
+    def _serialize_agent_result(result: AgentRunResult) -> dict[str, Any]:
+        value = asdict(result)
+        value.pop("workspace", None)
+        return value
+
+    @staticmethod
+    def _deserialize_agent_result(value: dict[str, Any]) -> AgentRunResult:
+        data = dict(value)
+        data["verification_results"] = [
+            CommandResult(
+                argv=tuple(item["argv"]), **{k: v for k, v in item.items() if k != "argv"}
+            )
+            for item in data.get("verification_results", [])
+        ]
+        data["baseline_verification_results"] = [
+            CommandResult(
+                argv=tuple(item["argv"]), **{k: v for k, v in item.items() if k != "argv"}
+            )
+            for item in data.get("baseline_verification_results", [])
+        ]
+        return AgentRunResult(**data)
 
     def report_status(
         self,
