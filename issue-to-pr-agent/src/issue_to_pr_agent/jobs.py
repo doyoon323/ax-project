@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .models import IssueTask
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    queued: list[str]
+    exhausted: list[str]
 
 
 class JobStore:
@@ -18,6 +24,7 @@ class JobStore:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -53,8 +60,16 @@ class JobStore:
             )
             return cursor.rowcount == 1
 
-    def recover(self, max_attempts: int) -> list[str]:
+    def recover(self, max_attempts: int) -> RecoveryResult:
         with self._connect() as connection:
+            exhausted_rows = connection.execute(
+                """
+                SELECT delivery_id FROM jobs
+                WHERE status IN ('queued', 'running') AND attempt_count >= ?
+                ORDER BY created_at
+                """,
+                (max_attempts,),
+            ).fetchall()
             connection.execute(
                 """
                 UPDATE jobs
@@ -75,7 +90,10 @@ class JobStore:
             rows = connection.execute(
                 "SELECT delivery_id FROM jobs WHERE status = 'queued' ORDER BY created_at"
             ).fetchall()
-        return [str(row[0]) for row in rows]
+        return RecoveryResult(
+            queued=[str(row[0]) for row in rows],
+            exhausted=[str(row[0]) for row in exhausted_rows],
+        )
 
     def get_issue(self, delivery_id: str) -> IssueTask:
         with self._connect() as connection:
@@ -159,4 +177,6 @@ class JobStore:
         return int(row[0])
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=10)
+        connection = sqlite3.connect(self.path, timeout=10)
+        connection.execute("PRAGMA synchronous=FULL")
+        return connection

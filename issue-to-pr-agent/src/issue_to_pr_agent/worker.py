@@ -35,7 +35,16 @@ class JobWorker:
 
     async def start(self) -> None:
         self.store.initialize()
-        for delivery_id in self.store.recover(self.max_attempts):
+        recovery = self.store.recover(self.max_attempts)
+        for delivery_id in recovery.exhausted:
+            issue = self.store.get_issue(delivery_id)
+            await self._notify(
+                issue,
+                "failed",
+                self.store.attempt_count(delivery_id),
+                "서비스 중단 후 재시도 한도가 소진되어 자동 게시를 중단했습니다.",
+            )
+        for delivery_id in recovery.queued:
             await self.queue.put(delivery_id)
         self._task = asyncio.create_task(self._run(), name="issue-to-pr-worker")
 
@@ -103,14 +112,7 @@ class JobWorker:
                         issue,
                         "failed",
                         attempt,
-                        (
-                            "자동 재시도 한도를 소진했습니다. 로컬 로그를 확인하세요."
-                            if attempt >= self.max_attempts
-                            else (
-                                "자동 재시도 대상이 아닌 오류입니다. 원인을 보완한 뒤 "
-                                "Issue 제목 또는 본문을 수정해 새 revision으로 접수하세요."
-                            )
-                        ),
+                        self._failure_detail(exc, attempt),
                     )
                     logger.exception("Issue-to-PR job failed for delivery %s", delivery_id)
             finally:
@@ -137,3 +139,20 @@ class JobWorker:
             return True
         status_code = getattr(exc, "status_code", None)
         return status_code == 429 or status_code in {408, 500, 502, 503, 504}
+
+    def _failure_detail(self, exc: Exception, attempt: int) -> str:
+        name = type(exc).__name__
+        if "Timeout" in name:
+            reason = "실행 시간 한도를 초과해 중단했습니다."
+        elif "Budget" in name:
+            reason = "토큰 또는 비용 한도를 초과해 중단했습니다."
+        elif "Complexity" in name or "AgentExecution" in name:
+            reason = "복잡도 또는 검증 기준을 충족하지 못해 사람 검토로 전환했습니다."
+        else:
+            reason = "안전하게 자동 처리할 수 없는 오류로 중단했습니다."
+        retry = (
+            " 자동 재시도 한도를 소진했습니다."
+            if attempt >= self.max_attempts
+            else " Issue를 보완하면 새 revision으로 다시 접수할 수 있습니다."
+        )
+        return f"{reason}{retry} 오류 분류: {name}."

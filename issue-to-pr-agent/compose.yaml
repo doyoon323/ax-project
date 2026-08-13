@@ -1,0 +1,87 @@
+services:
+  volume-init:
+    image: alpine:3.20
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - mkdir -p /worktrees /runner-queue/requests /runner-queue/responses /state && chown -R 10001:10001 /worktrees /runner-queue /state
+    volumes:
+      - worktrees:/worktrees
+      - runner-queue:/runner-queue
+      - state:/state
+    network_mode: none
+    restart: "no"
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    user: "10001:10001"
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    volumes:
+      - worktrees:/worktrees:ro
+      - runner-queue:/runner-queue
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; import time; p=Path('/runner-queue/runner-heartbeat'); raise SystemExit(0 if p.exists() and time.time()-p.stat().st_mtime < 10 else 1)"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "10001:10001"
+    env_file:
+      - .env
+    environment:
+      WORKSPACE_PATH: /target-repository
+      WORKTREE_ROOT: /worktrees
+      VERIFICATION_BACKEND: runner
+      VERIFICATION_RUNNER_QUEUE_PATH: /runner-queue
+      STATE_DB_PATH: /state/jobs.sqlite3
+      PUBLISH_ENABLED: ${CONTAINER_PUBLISH_ENABLED:-false}
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+      runner:
+        condition: service_healthy
+    volumes:
+      - ${WORKSPACE_PATH:?set WORKSPACE_PATH in .env}:/target-repository
+      - worktrees:/worktrees
+      - runner-queue:/runner-queue
+      - state:/state
+    ports:
+      - "8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  worktrees:
+  runner-queue:
+  state:

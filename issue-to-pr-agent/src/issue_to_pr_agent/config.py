@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     llm_api_base: str | None = None
     llm_retries: int = 2
     llm_max_output_tokens: int = 4_096
+    max_total_tokens_per_job: int = 30_000
+    max_estimated_cost_usd: float = 0.50
+    model_input_cost_per_million_usd: float = 2.0
+    model_output_cost_per_million_usd: float = 12.0
+    require_usage_accounting: bool = True
     base_branch: str = "main"
     max_turns: int = 3
     turn_delay_seconds: float = 4.1
@@ -37,14 +42,22 @@ class Settings(BaseSettings):
     git_author_name: str = "Issue-to-PR Agent"
     git_author_email: str = "issue-to-pr-agent@users.noreply.github.com"
     fetch_before_run: bool = True
+    allow_local_git_origin: bool = False
     require_verification: bool = True
+    require_fail_to_pass: bool = True
+    max_correction_cycles: int = 1
     required_verification_commands: list[list[str]] = Field(
         default_factory=lambda: [["python", "-m", "unittest", "discover", "-s", "tests", "-v"]]
     )
-    verification_backend: Literal["docker", "host"] = "docker"
+    verification_backend: Literal["docker", "host", "runner"] = "docker"
     verification_container_image: str = "python:3.13-slim"
+    verification_runner_queue_path: Path = Path("/runner-queue")
+    verification_runner_poll_seconds: float = 0.1
     allow_host_verification: bool = False
     verification_timeout_seconds: int = 120
+    job_timeout_seconds: int = 600
+    max_changed_files: int = 8
+    max_diff_lines: int = 800
     keep_failed_worktree: bool = False
     job_max_attempts: int = 2
     job_retry_delay_seconds: float = 10.0
@@ -55,6 +68,7 @@ class Settings(BaseSettings):
     max_output_lines: int = 50
     github_api_url: str = "https://api.github.com"
     github_api_version: str = "2022-11-28"
+    github_checks_enabled: bool = True
 
     model_config = SettingsConfigDict(
         env_file=None,
@@ -92,6 +106,58 @@ class Settings(BaseSettings):
             raise ValueError("LLM_MAX_OUTPUT_TOKENS must be between 512 and 16384")
         return value
 
+    @field_validator("max_total_tokens_per_job")
+    @classmethod
+    def bound_total_tokens(cls, value: int) -> int:
+        if not 1_000 <= value <= 200_000:
+            raise ValueError("MAX_TOTAL_TOKENS_PER_JOB must be between 1000 and 200000")
+        return value
+
+    @field_validator("max_estimated_cost_usd")
+    @classmethod
+    def bound_cost_budget(cls, value: float) -> float:
+        if not 0.01 <= value <= 20:
+            raise ValueError("MAX_ESTIMATED_COST_USD must be between 0.01 and 20")
+        return value
+
+    @field_validator(
+        "model_input_cost_per_million_usd",
+        "model_output_cost_per_million_usd",
+    )
+    @classmethod
+    def validate_model_prices(cls, value: float) -> float:
+        if not 0 <= value <= 100:
+            raise ValueError("model token prices must be between 0 and 100 USD per million")
+        return value
+
+    @field_validator("max_correction_cycles")
+    @classmethod
+    def bound_correction_cycles(cls, value: int) -> int:
+        if not 0 <= value <= 2:
+            raise ValueError("MAX_CORRECTION_CYCLES must be between 0 and 2")
+        return value
+
+    @field_validator("job_timeout_seconds")
+    @classmethod
+    def bound_job_timeout(cls, value: int) -> int:
+        if not 60 <= value <= 3_600:
+            raise ValueError("JOB_TIMEOUT_SECONDS must be between 60 and 3600")
+        return value
+
+    @field_validator("max_changed_files")
+    @classmethod
+    def bound_changed_files(cls, value: int) -> int:
+        if not 1 <= value <= 50:
+            raise ValueError("MAX_CHANGED_FILES must be between 1 and 50")
+        return value
+
+    @field_validator("max_diff_lines")
+    @classmethod
+    def bound_diff_lines(cls, value: int) -> int:
+        if not 20 <= value <= 10_000:
+            raise ValueError("MAX_DIFF_LINES must be between 20 and 10000")
+        return value
+
     @field_validator("job_max_attempts")
     @classmethod
     def bound_job_attempts(cls, value: int) -> int:
@@ -111,6 +177,13 @@ class Settings(BaseSettings):
     def bound_verification_timeout(cls, value: int) -> int:
         if not 10 <= value <= 900:
             raise ValueError("VERIFICATION_TIMEOUT_SECONDS must be between 10 and 900")
+        return value
+
+    @field_validator("verification_runner_poll_seconds")
+    @classmethod
+    def bound_runner_poll_interval(cls, value: float) -> float:
+        if not 0.02 <= value <= 2:
+            raise ValueError("VERIFICATION_RUNNER_POLL_SECONDS must be between 0.02 and 2")
         return value
 
     @field_validator("required_verification_commands")

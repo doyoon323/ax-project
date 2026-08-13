@@ -6,9 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from pydantic import SecretStr
 
-from issue_to_pr_agent.agent import IssueFixAgent
+from issue_to_pr_agent.agent import AgentBudgetError, IssueFixAgent
 from issue_to_pr_agent.config import Settings
 from issue_to_pr_agent.models import IssueTask
 from issue_to_pr_agent.tools import WorkspaceTools
@@ -24,6 +25,7 @@ def make_settings(tmp_path: Path) -> Settings:
         state_db_path=tmp_path / "jobs.sqlite3",
         worktree_root=tmp_path.parent / "worktrees",
         fetch_before_run=False,
+        require_fail_to_pass=False,
     )
 
 
@@ -350,3 +352,89 @@ def test_wrong_phase_is_corrected_before_tools_run(tmp_path: Path) -> None:
     assert decision.phase == "diagnose"
     assert len(calls) == 2
     assert any("CORRECTION REQUIRED" in message["content"] for message in calls[1]["messages"])
+
+
+def test_failed_gate_gets_one_bounded_correction_cycle(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "sample.py").write_text("value = 1\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_sample.py").write_text(
+        "import unittest\nfrom sample import value\n\n"
+        "class ValueTest(unittest.TestCase):\n"
+        "    def test_value(self):\n        self.assertEqual(value, 2)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    replies = iter(
+        [
+            response({"phase": "diagnose", "note": "inspect", "commands": []}),
+            response(
+                {
+                    "phase": "patch",
+                    "note": "first attempt",
+                    "edits": [{"path": "sample.py", "search": "value = 1", "replace": "value = 0"}],
+                    "commands": [],
+                }
+            ),
+            response(
+                {
+                    "phase": "verify",
+                    "note": "verify",
+                    "commands": [],
+                    "finish": True,
+                    "summary": "first attempt",
+                }
+            ),
+            response(
+                {
+                    "phase": "patch",
+                    "note": "correct from evidence",
+                    "edits": [{"path": "sample.py", "search": "value = 0", "replace": "value = 2"}],
+                    "commands": [],
+                }
+            ),
+            response(
+                {
+                    "phase": "verify",
+                    "note": "corrected",
+                    "commands": [],
+                    "finish": True,
+                    "summary": "corrected value",
+                }
+            ),
+        ]
+    )
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=9,
+        title="Set value to two",
+        body="Regression test describes the expected result.",
+        author="octocat",
+        author_association="OWNER",
+    )
+
+    result = IssueFixAgent(
+        make_settings(tmp_path),
+        completion_fn=lambda **_: next(replies),
+        sleep_fn=lambda _: None,
+    ).run(issue, WorkspaceTools(tmp_path))
+
+    assert result.correction_cycles == 1
+    assert (tmp_path / "sample.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert all(item.succeeded for item in result.verification_results)
+
+
+def test_provider_usage_stops_at_token_budget(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path).model_copy(update={"max_total_tokens_per_job": 1_000})
+    agent = IssueFixAgent(settings)
+    over_budget = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=800, completion_tokens=201, total_tokens=1_001)
+    )
+
+    with pytest.raises(AgentBudgetError, match="token budget exceeded"):
+        agent._record_usage(over_budget)

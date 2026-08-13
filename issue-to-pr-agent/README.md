@@ -8,8 +8,8 @@ GitHub Issue(opened/labeled 또는 주기 조회)
   -> 저장소·작성자·ai-fix 라벨 검증
   -> SQLite 중복 방지·재시작 복구 + 단일 로컬 워커
   -> 임시 Git worktree
-  -> bounded loop: diagnose -> patch -> verify
-  -> 서버 소유 필수 회귀 테스트 + 격리 검증 성공
+  -> bounded loop: diagnose -> patch -> verify -> 실패 시 1회 교정
+  -> 수정 전 실패/수정 후 성공 + 서버 소유 격리 검증
   -> commit/push -> Draft PR -> assignee/comment
 ```
 
@@ -22,10 +22,12 @@ GitHub Issue(opened/labeled 또는 주기 조회)
 - Agent는 `shell=True`, 임의 Python 실행, Git 쓰기 명령을 사용할 수 없습니다.
 - `.env`, Git 내부 파일, 인증서·키 파일은 편집하거나 게시하지 않습니다.
 - 원본 checkout 대신 `origin/main`에서 만든 임시 worktree만 수정합니다.
-- 검증 명령은 기본적으로 네트워크·권한·자원을 제한한 Docker 컨테이너에서 실행합니다.
+- Compose 운영에서는 Agent와 무권한 Runner를 분리합니다. Runner에는 토큰과 네트워크가 없습니다.
+- Runner는 Worktree를 읽기 전용으로 마운트하고 임시 bytecode는 `/tmp`에만 기록합니다.
 - 모델 제안과 별도로 서버가 `git diff --check`와 필수 회귀 테스트를 실행합니다.
 - 게시 전 토큰의 GitHub 로그인과 `GITHUB_EXPECTED_LOGIN`이 일치해야 합니다.
 - 변경사항과 필수 검증 성공이 모두 있어야 Draft PR을 만들 수 있습니다.
+- Agent 단계 10분·8파일·800줄·3만 토큰·예상 $0.50을 넘으면 사람 검토로 전환합니다.
 
 이 안전장치는 컨테이너/VM 샌드박스를 대체하지 않습니다. 공개 저장소에서 불특정 사용자의
 Issue를 처리하는 용도로는 아직 적합하지 않습니다.
@@ -70,9 +72,26 @@ Fine-grained GitHub 토큰에는 대상 저장소의 다음 권한이 필요합�
 - Contents: Read and write
 - Pull requests: Read and write
 - Issues: Read and write
+- Checks: Read and write (`GITHUB_CHECKS_ENABLED=true`일 때)
 - Metadata: Read
 
 로컬 `origin`에도 해당 브랜치를 push할 인증이 설정되어 있어야 합니다.
+기본값은 정확히 `github.com/<GITHUB_REPOSITORY>`인 HTTPS/SSH origin만 허용합니다.
+`WORKSPACE_PATH`는 운영자가 신뢰하는 로컬 clone이어야 하며 임의 사용자가 등록할 수 없습니다.
+
+## 실행: Docker Compose
+
+`.env`의 `WORKSPACE_PATH`를 호스트 대상 저장소 절대경로로 둔 뒤 실행합니다.
+
+```bash
+docker compose up --build
+```
+
+컨테이너도 기본은 `PUBLISH_ENABLED=false`입니다. dry-run을 확인한 뒤에만
+`CONTAINER_PUBLISH_ENABLED=true docker compose up --build`로 게시를 엽니다. Agent는
+GitHub·Gemini에 접근하지만 테스트는 별도 Runner에서 실행됩니다. Runner는 네트워크 차단,
+capability 제거, read-only root, CPU·메모리·PID 제한을 사용하며 API 토큰을 받지 않습니다.
+추가 의존성이 필요한 저장소는 `Dockerfile.runner`를 잠금 파일 기준으로 확장해야 합니다.
 
 ## 실행: 로컬 Poll 모드
 
@@ -83,13 +102,16 @@ Fine-grained GitHub 토큰에는 대상 저장소의 다음 권한이 필요합�
 `ISSUE_SOURCE=poll`은 로컬 데모용입니다. 별도 공개 URL 없이 15초마다 열린 Issue를 조회합니다. `ai-fix` 라벨이
 있고 작성자 관계가 `OWNER`, `MEMBER`, `COLLABORATOR`인 Issue만 한 번씩 큐에 넣습니다.
 이미 코드가 요구사항을 충족하면 PR을 억지로 만들지 않고 `no-change` 댓글을 남깁니다.
-기본 모델은 코드 수정 품질을 우선한 유료 Gemini 3.1 Pro Preview입니다. 사용 모델과 공급자가
+기본 모델은 코드 수정 품질을 우선한 유료 Gemini 3.1 Pro Preview입니다. 현재 기본 비용 계산은
+2026-08-13 기준 [공식 Standard 단가](https://ai.google.dev/gemini-api/docs/pricing)의 입력 $2/백만,
+출력 $12/백만(요청 20만 토큰 이하)을 사용합니다. 사용 모델과 공급자가
 보고한 토큰 수는 SQLite 결과와 Draft PR에 남습니다. `LLM_FALLBACK_MODEL`을 설정한 경우에만
 429 또는 5xx 뒤 예비 모델로 전환하며, 인증·요청 형식 오류에는 전환하지 않습니다.
 
-작업 실패는 429·5xx·네트워크 오류에 한해 최대 2회 재시도합니다. 중단된 `running` 작업도
-SQLite 시도 횟수로 복구합니다. 최종 실패 뒤 제목·본문을 보완하면 새 revision으로 재접수됩니다.
-게시 모드에서는 하나의 GitHub 상태 댓글을 갱신합니다.
+작업 실패는 429·5xx·네트워크 오류에 한해 최대 2회 재시도합니다. 테스트 실패는 관찰 결과로
+1회만 수정·재검증합니다. 중단된 `running` 작업은 SQLite 시도 횟수로 복구하고, push 뒤 API가
+실패해도 Agent 전용 브랜치를 lease 조건으로 갱신해 재개합니다. 최종 실패 뒤 제목·본문을
+보완하면 새 revision으로 재접수됩니다. 게시 모드에서는 Issue 상태 댓글과 PR Check를 남깁니다.
 
 ## 선택: Webhook 모드
 
@@ -122,10 +144,13 @@ GitHub 저장소의 `Settings -> Webhooks -> Add webhook`에서 설정합니다.
 `/health`는 서버 상태와 게시 활성화 여부만 반환합니다. 작업 실패 원인은 로컬 로그와
 `.state/jobs.sqlite3`에 기록됩니다. `.state`와 `.env`는 Git에서 제외됩니다.
 
-## 의도적으로 남긴 범위
+## 발표 시 명확히 밝힐 남은 위험
 
-- `compileall` 성공만으로 수정이 맞다고 판단하지 않습니다. 기본 필수 게이트는 전체 unittest입니다.
-- 수정 전 실패와 수정 후 성공을 자동 비교하는 fail-to-pass 증명은 아직 강제하지 않습니다.
-- Docker는 검증 프로세스를 격리하지만 의존성을 자동 설치하지 않습니다. 저장소별 사전 빌드
-  이미지를 `VERIFICATION_CONTAINER_IMAGE`로 지정해야 합니다.
-- Gemini 3.1 Pro는 Preview이므로 모델 종료 공지를 확인하고 교체해야 합니다.
+1. 실제 GitHub Issue→Gemini→Draft PR 전체 흐름은 토큰·비용·외부 변경이 있어 별도 E2E가 필요합니다.
+2. Runner는 의존성을 자동 설치하지 않으며 저장소별 잠금 이미지와 digest 고정이 필요합니다.
+3. SQLite 단일 Worker라 다중 인스턴스, 분산 lease, 수평 확장은 지원하지 않습니다.
+4. 비용 한도는 시도별입니다. 게시 단계 재시도까지 합친 누적 비용 원장은 아직 없습니다.
+5. fail-to-pass도 LLM이 만든 테스트의 요구사항 해석 자체가 틀리면 의미 정확성을 보장하지 못합니다.
+6. 일반 Docker 격리이므로 공개 저장소에는 gVisor·VM 같은 더 강한 샌드박스가 필요합니다.
+7. GitHub Check를 Required Check로 강제하는 Branch Protection은 저장소에서 별도 설정해야 합니다.
+8. Gemini 3.1 Pro는 Preview이며 모델 종료·가격 변경 시 운영 설정을 갱신해야 합니다.

@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from issue_to_pr_agent.models import FileEdit
-from issue_to_pr_agent.tools import ToolPolicyError, WorkspaceTools, truncate_output
+from issue_to_pr_agent.tools import (
+    ComplexityLimitError,
+    ToolPolicyError,
+    WorkspaceTools,
+    truncate_output,
+)
 
 
 def test_truncate_output_keeps_within_limits() -> None:
@@ -103,4 +108,47 @@ def test_docker_verification_is_networkless_and_resource_limited(tmp_path: Path)
     assert "--read-only" in command
     assert "--cap-drop=ALL" in command
     assert "--pull=never" in command
-    assert f"type=bind,src={tmp_path.resolve()},dst=/workspace,rw" in command
+    assert f"type=bind,src={tmp_path.resolve()},dst=/workspace,ro" in command
+
+
+def test_complexity_limit_and_fail_to_pass_proof(tmp_path: Path) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "calculator.py").write_text(
+        "def add(left, right):\n    return left - right\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "calculator.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=tmp_path, check=True)
+    tools = WorkspaceTools(tmp_path)
+    tools.apply_edits(
+        [
+            FileEdit(
+                path="calculator.py",
+                search="return left - right",
+                replace="return left + right",
+            ),
+            FileEdit(
+                mode="create",
+                path="tests/test_calculator.py",
+                search="",
+                replace=(
+                    "import unittest\nfrom calculator import add\n\n"
+                    "class AddTest(unittest.TestCase):\n"
+                    "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n"
+                ),
+            ),
+        ]
+    )
+
+    with pytest.raises(ComplexityLimitError, match="touches 2 files"):
+        tools.enforce_change_limits(max_files=1, max_diff_lines=100)
+    baseline = tools.run_fail_to_pass(
+        [Path("tests/test_calculator.py")],
+        [["python", "-m", "unittest", "discover", "-s", "tests"]],
+    )
+
+    assert any(not result.succeeded for result in baseline)
+    assert tools.run(["python", "-m", "unittest", "discover", "-s", "tests"], "verify").succeeded

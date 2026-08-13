@@ -38,6 +38,9 @@ class IssueToPRService:
                 max_output_lines=self.settings.max_output_lines,
                 verification_backend=self.settings.verification_backend,
                 verification_container_image=self.settings.verification_container_image,
+                verification_runner_queue_path=self.settings.verification_runner_queue_path,
+                runner_worktree_root=self.settings.worktree_root,
+                verification_runner_poll_seconds=self.settings.verification_runner_poll_seconds,
             )
             agent_result = IssueFixAgent(self.settings).run(issue, tools)
             run_metadata = {
@@ -47,6 +50,10 @@ class IssueToPRService:
                     "completion_tokens": agent_result.completion_tokens,
                     "total_tokens": agent_result.total_tokens,
                 },
+                "estimated_cost_usd": agent_result.estimated_cost_usd,
+                "correction_cycles": agent_result.correction_cycles,
+                "duration_seconds": agent_result.duration_seconds,
+                "fail_to_pass_proven": bool(agent_result.baseline_verification_results),
             }
 
             if not agent_result.changed_paths:
@@ -84,12 +91,26 @@ class IssueToPRService:
                 agent_result.changed_paths,
             )
             publish_result = self.github.publish_draft_pr(issue, session.branch, agent_result)
+            check_warning = ""
+            if self.settings.github_checks_enabled:
+                try:
+                    self.github.upsert_verification_check(
+                        issue,
+                        self.workspaces.current_head(session),
+                        agent_result,
+                    )
+                except GitHubPublishError:
+                    check_warning = "GitHub Check를 기록하지 못했지만 Draft PR은 생성했습니다."
             succeeded = True
+            published = asdict(publish_result)
+            published["warning"] = " ".join(
+                item for item in (publish_result.warning, check_warning) if item
+            )
             return {
                 "status": "published",
                 "changed_files": changed_files,
                 **run_metadata,
-                **asdict(publish_result),
+                **published,
             }
         finally:
             if session is not None and (succeeded or not self.settings.keep_failed_worktree):

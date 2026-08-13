@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -130,11 +131,16 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
+        runner_ready = True
+        if active_settings.verification_backend == "runner":
+            heartbeat = active_settings.verification_runner_queue_path / "runner-heartbeat"
+            runner_ready = heartbeat.exists() and time.time() - heartbeat.stat().st_mtime < 10
         return {
-            "status": "ok",
+            "status": "ok" if runner_ready else "degraded",
             "issue_source": active_settings.issue_source,
             "publish_enabled": active_settings.publish_enabled,
             "verification_backend": active_settings.verification_backend,
+            "verification_runner_ready": runner_ready,
         }
 
     @app.post("/webhook")

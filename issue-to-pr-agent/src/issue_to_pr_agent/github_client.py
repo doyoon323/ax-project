@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -114,12 +115,30 @@ class GitWorkspaceManager:
             ],
             cwd=session.path,
         )
+        remote_ref = f"refs/heads/{session.branch}"
+        existing = self._git(
+            ["ls-remote", "--heads", "origin", remote_ref],
+            cwd=session.path,
+        )
+        push_arguments = ["push", "--set-upstream"]
+        if existing:
+            remote_sha = existing.split(maxsplit=1)[0]
+            if re.fullmatch(r"[0-9a-f]{40,64}", remote_sha) is None:
+                raise GitOperationError("remote agent branch returned an invalid commit id")
+            push_arguments.append(f"--force-with-lease={remote_ref}:{remote_sha}")
+        push_arguments.extend(["origin", f"HEAD:{remote_ref}"])
         self._git(
-            ["push", "--set-upstream", "origin", f"HEAD:refs/heads/{session.branch}"],
+            push_arguments,
             cwd=session.path,
             timeout=120,
         )
         return changed_files
+
+    def current_head(self, session: WorktreeSession) -> str:
+        head = self._git(["rev-parse", "HEAD"], cwd=session.path)
+        if re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+            raise GitOperationError("published worktree has an invalid commit id")
+        return head
 
     def cleanup(self, session: WorktreeSession) -> None:
         if session.path.exists():
@@ -131,9 +150,30 @@ class GitWorkspaceManager:
         if Path(root).resolve() != self.repository_root:
             raise GitOperationError("WORKSPACE_PATH must point to the target repository root")
         origin = self._git(["remote", "get-url", "origin"], cwd=self.repository_root)
-        normalized = origin.removesuffix(".git").replace(":", "/")
-        if not normalized.endswith(f"/{self.settings.github_repository}"):
+        if self._is_local_origin(origin):
+            if not self.settings.allow_local_git_origin:
+                raise GitOperationError("local Git origins are disabled")
+            return
+        if not self._matches_github_origin(origin):
             raise GitOperationError("origin remote does not match GITHUB_REPOSITORY")
+
+    @staticmethod
+    def _is_local_origin(origin: str) -> bool:
+        return origin.startswith(("/", "./", "../", "file://"))
+
+    def _matches_github_origin(self, origin: str) -> bool:
+        expected_path = f"/{self.settings.github_repository}"
+        if origin.startswith("git@github.com:"):
+            actual_path = "/" + origin.removeprefix("git@github.com:").removesuffix(".git")
+            return actual_path == expected_path
+        parsed = urlparse(origin)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "github.com"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path.removesuffix(".git") == expected_path
+        )
 
     def _git(
         self,
@@ -317,6 +357,59 @@ class GitHubClient:
             expected={200},
         )
 
+    def upsert_verification_check(
+        self,
+        issue: IssueTask,
+        head_sha: str,
+        result: AgentRunResult,
+    ) -> None:
+        name = "Issue-to-PR Agent / verification"
+        payload = {
+            "name": name,
+            "head_sha": head_sha,
+            "external_id": issue.delivery_id,
+            "status": "completed",
+            "conclusion": "success",
+            "output": {
+                "title": "Bounded verification passed",
+                "summary": self._check_summary(result),
+            },
+        }
+        existing = self._request(
+            "GET",
+            f"/repos/{self.settings.github_repository}/commits/{head_sha}/check-runs",
+            params={"check_name": name, "filter": "latest", "per_page": 100},
+            expected={200},
+        )
+        check_runs = (existing or {}).get("check_runs", [])
+        match = next(
+            (
+                item
+                for item in check_runs
+                if isinstance(item, dict) and item.get("external_id") == issue.delivery_id
+            ),
+            None,
+        )
+        if match is None:
+            self._request(
+                "POST",
+                f"/repos/{self.settings.github_repository}/check-runs",
+                json=payload,
+                expected={201},
+            )
+            return
+        check_id = match.get("id")
+        if not isinstance(check_id, int):
+            raise GitHubPublishError("existing verification check has no numeric id")
+        update = dict(payload)
+        update.pop("head_sha")
+        self._request(
+            "PATCH",
+            f"/repos/{self.settings.github_repository}/check-runs/{check_id}",
+            json=update,
+            expected={200},
+        )
+
     def _find_pull_request(self, branch: str) -> dict[str, Any] | None:
         owner = self.settings.github_repository.split("/", 1)[0]
         pulls = self._request(
@@ -454,16 +547,41 @@ class GitHubClient:
             if result.total_tokens
             else "not reported by provider"
         )
+        baseline = (
+            "failed as expected"
+            if result.baseline_verification_results
+            and any(not item.succeeded for item in result.baseline_verification_results)
+            else "not recorded"
+        )
         return (
             f"{details}\n\n"
             "### Verification\n"
             f"{verification or '- No verification recorded'}\n\n"
             "### Agent run\n"
             f"- Models: {models}\n"
-            f"- Recorded tokens: {usage}\n\n"
+            f"- Recorded tokens: {usage}\n"
+            f"- Estimated cost: `${result.estimated_cost_usd:.4f}`\n"
+            f"- Correction cycles: {result.correction_cycles}\n"
+            f"- Fail-to-pass baseline: {baseline}\n"
+            f"- Duration: {result.duration_seconds:.3f}s\n\n"
             f"Closes #{issue.number}\n\n"
             "_Generated as a Draft PR by Issue-to-PR Agent. Human review is required._"
         )
+
+    @staticmethod
+    def _check_summary(result: AgentRunResult) -> str:
+        commands = "\n".join(
+            f"- `{' '.join(item.argv)}`: {'passed' if item.succeeded else 'failed'}"
+            for item in result.verification_results
+        )
+        return (
+            f"{commands or '- No commands recorded'}\n\n"
+            "Fail-to-pass: "
+            f"{'passed' if result.baseline_verification_results else 'not recorded'}; "
+            f"corrections: {result.correction_cycles}; "
+            f"tokens: {result.total_tokens}; "
+            f"estimated cost: ${result.estimated_cost_usd:.4f}."
+        )[:65_000]
 
     @staticmethod
     def _status_comment_body(

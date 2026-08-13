@@ -14,7 +14,7 @@ from issue_to_pr_agent.config import Settings
 from issue_to_pr_agent.github_client import GitHubClient, GitHubPublishError
 from issue_to_pr_agent.jobs import JobStore
 from issue_to_pr_agent.main import create_app, extract_issue_task, verify_webhook_signature
-from issue_to_pr_agent.models import IssueTask
+from issue_to_pr_agent.models import AgentRunResult, CommandResult, IssueTask
 from issue_to_pr_agent.worker import JobWorker
 
 
@@ -93,6 +93,69 @@ def test_github_token_identity_mismatch_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(GitHubPublishError, match="identity mismatch"):
         client.validate_identity()
+
+
+def test_github_verification_check_is_created_idempotently(tmp_path: Path) -> None:
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+        content = b"{}"
+
+        def __init__(self, payload: dict, status_code: int = 200) -> None:
+            self.payload = payload
+            self.status_code = status_code
+
+        def json(self) -> dict:
+            return self.payload
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+            self.calls: list[tuple[str, str, dict]] = []
+
+        def request(self, method: str, url: str, **kwargs: object) -> FakeResponse:
+            self.calls.append((method, url, kwargs))
+            if method == "GET":
+                return FakeResponse({"check_runs": []})
+            return FakeResponse({}, status_code=201)
+
+    session = FakeSession()
+    client = GitHubClient(make_settings(tmp_path), session=session)  # type: ignore[arg-type]
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Fix a bug",
+        body="Expected behavior",
+        author="octocat",
+        author_association="OWNER",
+    )
+    result = AgentRunResult(
+        success=True,
+        summary="fixed",
+        verification_results=[
+            CommandResult(
+                argv=("python", "-m", "unittest"),
+                return_code=0,
+                output="OK",
+                is_verification=True,
+            )
+        ],
+        baseline_verification_results=[
+            CommandResult(
+                argv=("python", "-m", "unittest"),
+                return_code=1,
+                output="failed as expected",
+                is_verification=True,
+            )
+        ],
+    )
+
+    client.upsert_verification_check(issue, "a" * 40, result)
+
+    assert [call[0] for call in session.calls] == ["GET", "POST"]
+    assert session.calls[1][2]["json"]["conclusion"] == "success"
+    assert session.calls[1][2]["json"]["external_id"] == issue.delivery_id
 
 
 def issue_payload() -> dict:
@@ -222,8 +285,32 @@ def test_running_job_is_recovered_within_retry_budget(tmp_path: Path) -> None:
     store.enqueue(issue)
     assert store.mark_running(issue.delivery_id) == 1
 
-    assert store.recover(max_attempts=2) == [issue.delivery_id]
+    recovery = store.recover(max_attempts=2)
+    assert recovery.queued == [issue.delivery_id]
+    assert recovery.exhausted == []
     assert store.status(issue.delivery_id) == "queued"
+
+
+def test_running_job_is_failed_when_restart_budget_is_exhausted(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.initialize()
+    issue = IssueTask(
+        delivery_id="abcdef12-3456",
+        repository="owner/repository",
+        number=42,
+        title="Fix a bug",
+        body="Expected behavior",
+        author="octocat",
+        author_association="OWNER",
+    )
+    store.enqueue(issue)
+    assert store.mark_running(issue.delivery_id) == 1
+
+    recovery = store.recover(max_attempts=1)
+
+    assert recovery.queued == []
+    assert recovery.exhausted == [issue.delivery_id]
+    assert store.status(issue.delivery_id) == "failed"
 
 
 def test_github_status_comment_is_stable_and_sanitized() -> None:

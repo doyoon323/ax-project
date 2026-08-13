@@ -48,6 +48,7 @@ def test_worktree_publishes_only_explicit_agent_edits(tmp_path: Path) -> None:
         worktree_root=tmp_path / "worktrees",
         state_db_path=tmp_path / "jobs.sqlite3",
         fetch_before_run=False,
+        allow_local_git_origin=True,
     )
     issue = IssueTask(
         delivery_id="abcdef12-3456",
@@ -59,6 +60,9 @@ def test_worktree_publishes_only_explicit_agent_edits(tmp_path: Path) -> None:
         author_association="OWNER",
     )
     manager = GitWorkspaceManager(settings)
+    assert manager._matches_github_origin("https://github.com/owner/repository.git")
+    assert manager._matches_github_origin("git@github.com:owner/repository.git")
+    assert not manager._matches_github_origin("https://attacker.example/owner/repository.git")
     session = manager.prepare(issue)
     try:
         (session.path / "sample.py").write_text("value = 2\n", encoding="utf-8")
@@ -71,3 +75,13 @@ def test_worktree_publishes_only_explicit_agent_edits(tmp_path: Path) -> None:
         assert branch_tree == "sample.py"
     finally:
         manager.cleanup(session)
+
+    retry = manager.prepare(issue)
+    try:
+        (retry.path / "sample.py").write_text("value = 3\n", encoding="utf-8")
+        changed = manager.commit_and_push(retry, issue.number, ["sample.py"])
+
+        assert changed == ["sample.py"]
+        assert git(remote, "show", f"{retry.branch}:sample.py") == "value = 3"
+    finally:
+        manager.cleanup(retry)
