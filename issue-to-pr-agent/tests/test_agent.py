@@ -229,6 +229,7 @@ def test_rate_limit_switches_to_sticky_groq_fallback(tmp_path: Path) -> None:
     assert agent._active_model == "groq/openai/gpt-oss-120b"
     assert calls[1]["api_key"] == "groq-test-key"
     assert calls[1]["response_format"]["type"] == "json_schema"
+    assert calls[1]["max_tokens"] == 2_048
 
     fallback_arguments = {
         "model": agent._active_model,
@@ -273,6 +274,14 @@ def test_phase_schemas_include_only_required_fields() -> None:
     }
 
 
+def test_groq_output_budget_leaves_room_under_free_tpm_limit(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path).model_copy(update={"llm_max_output_tokens": 8_192})
+    agent = IssueFixAgent(settings)
+
+    assert agent._max_output_tokens_for_model("gemini/gemini-flash-latest") == 8_192
+    assert agent._max_output_tokens_for_model("groq/openai/gpt-oss-120b") == 2_048
+
+
 def test_system_prompt_disables_provider_native_and_shell_tools() -> None:
     prompt = IssueFixAgent._system_prompt()
 
@@ -311,6 +320,7 @@ def test_groq_json_generation_failure_is_retried(tmp_path: Path) -> None:
 def test_groq_rate_limit_is_retried_without_retrying_gemini_quota(tmp_path: Path) -> None:
     calls = 0
     expected = object()
+    sleeps: list[float] = []
 
     class RateLimited(RuntimeError):
         status_code = 429
@@ -319,13 +329,14 @@ def test_groq_rate_limit_is_retried_without_retrying_gemini_quota(tmp_path: Path
         nonlocal calls
         calls += 1
         if calls == 1:
-            raise RateLimited("try again shortly")
+            raise RateLimited("Please try again in 20.49s")
         return expected
 
-    agent = IssueFixAgent(make_settings(tmp_path), completion_fn=complete, sleep_fn=lambda _: None)
+    agent = IssueFixAgent(make_settings(tmp_path), completion_fn=complete, sleep_fn=sleeps.append)
 
     assert agent._complete_with_transient_retries({"model": "groq/openai/gpt-oss-120b"}) is expected
     assert calls == 2
+    assert sleeps == [20.99]
 
     calls = 0
     try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -491,7 +492,7 @@ class IssueFixAgent:
             "messages": messages,
             "response_format": self._response_format_for_model(self._active_model, phase),
             "timeout": min(60, remaining),
-            "max_tokens": self.settings.llm_max_output_tokens,
+            "max_tokens": self._max_output_tokens_for_model(self._active_model),
             "temperature": 0.2,
             # Provider-native retries also retry exhausted quotas. Keep them off and
             # retry only explicitly classified failures in the bounded wrapper below.
@@ -524,8 +525,15 @@ class IssueFixAgent:
                 )
                 if not transient or attempt >= self.settings.llm_retries:
                     raise
-                self._pause(self.settings.turn_delay_seconds)
+                self._pause(self._provider_retry_delay(exc))
         raise AgentExecutionError("LLM retry loop exited unexpectedly")
+
+    def _provider_retry_delay(self, exc: Exception) -> float:
+        match = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", str(exc), re.IGNORECASE)
+        if match is None:
+            return self.settings.turn_delay_seconds
+        requested = float(match.group(1)) + 0.5
+        return min(60.0, max(self.settings.turn_delay_seconds, requested))
 
     def _complete_with_fallback(self, arguments: dict[str, Any], phase: Phase = "patch") -> Any:
         try:
@@ -555,11 +563,19 @@ class IssueFixAgent:
             fallback_arguments["response_format"] = self._response_format_for_model(
                 fallback_model, phase
             )
+            fallback_arguments["max_tokens"] = self._max_output_tokens_for_model(fallback_model)
             fallback_arguments.pop("api_key", None)
             fallback_arguments.pop("api_base", None)
             if fallback_key:
                 fallback_arguments["api_key"] = fallback_key
             return self._complete_with_transient_retries(fallback_arguments)
+
+    def _max_output_tokens_for_model(self, model: str) -> int:
+        if model.startswith("groq/"):
+            # The free Groq fallback has an 8K TPM request ceiling. Keep enough room
+            # for accumulated prompt context instead of making every request invalid.
+            return min(self.settings.llm_max_output_tokens, 2_048)
+        return self.settings.llm_max_output_tokens
 
     @staticmethod
     def _response_format_for_model(model: str, phase: Phase = "patch") -> dict[str, Any]:
