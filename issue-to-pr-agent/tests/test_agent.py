@@ -143,7 +143,7 @@ def test_fixed_loop_runs_three_phases(tmp_path: Path) -> None:
     )
 
 
-def test_verified_no_change_returns_success(tmp_path: Path) -> None:
+def test_empty_patch_fails_closed_after_bounded_retries(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / "sample.py").write_text("value = 1\n", encoding="utf-8")
     write_regression_test(tmp_path)
@@ -165,11 +165,16 @@ def test_verified_no_change_returns_success(tmp_path: Path) -> None:
             ),
             response(
                 {
-                    "phase": "verify",
-                    "note": "Verified the existing implementation.",
-                    "commands": [["git", "diff", "--", "sample.py"]],
-                    "finish": True,
-                    "summary": "The requested behavior is already implemented.",
+                    "phase": "patch",
+                    "note": "Still no edit.",
+                    "commands": [],
+                }
+            ),
+            response(
+                {
+                    "phase": "patch",
+                    "note": "Claim completion without an edit.",
+                    "commands": [],
                 }
             ),
         ]
@@ -184,14 +189,12 @@ def test_verified_no_change_returns_success(tmp_path: Path) -> None:
         author_association="OWNER",
     )
 
-    result = IssueFixAgent(
-        make_settings(tmp_path),
-        completion_fn=lambda **_: next(replies),
-        sleep_fn=lambda _: None,
-    ).run(issue, WorkspaceTools(tmp_path))
-
-    assert result.success
-    assert result.changed_paths == []
+    with pytest.raises(AgentExecutionError, match="patch phase requires at least one file edit"):
+        IssueFixAgent(
+            make_settings(tmp_path),
+            completion_fn=lambda **_: next(replies),
+            sleep_fn=lambda _: None,
+        ).run(issue, WorkspaceTools(tmp_path))
 
 
 def test_rate_limit_switches_to_sticky_groq_fallback(tmp_path: Path) -> None:

@@ -111,7 +111,8 @@ capability 제거, read-only root, CPU·메모리·PID 제한을 사용하며 AP
 
 `ISSUE_SOURCE=poll`은 로컬 데모용입니다. 별도 공개 URL 없이 15초마다 열린 Issue를 조회합니다. `ai-fix` 라벨이
 있고 작성자 관계가 `OWNER`, `MEMBER`, `COLLABORATOR`인 Issue만 한 번씩 큐에 넣습니다.
-이미 코드가 요구사항을 충족하면 PR을 억지로 만들지 않고 `no-change` 댓글을 남깁니다.
+Patch 단계에서 실제 파일 변경이 없으면 성공으로 보고하지 않고 사람 검토가 필요한 실패로 종료합니다.
+따라서 모델의 설명만으로 `no-change` 완료나 Draft PR 생략을 정당화할 수 없습니다.
 기본 모델은 코드 수정 품질을 우선한 유료 Gemini 3.1 Pro Preview입니다. 현재 기본 비용 계산은
 2026-08-13 기준 [공식 Standard 단가](https://ai.google.dev/gemini-api/docs/pricing)의 입력 $2/백만,
 출력 $12/백만(요청 20만 토큰 이하)을 사용합니다. 사용 모델과 공급자가

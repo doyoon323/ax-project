@@ -3,11 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from .agent import IssueFixAgent
+from .agent import AgentExecutionError, IssueFixAgent
 from .config import Settings
 from .github_client import (
     GitHubClient,
-    GitHubPublishError,
     GitWorkspaceManager,
     WorktreeSession,
 )
@@ -81,23 +80,10 @@ class IssueToPRService:
             }
 
             if not agent_result.changed_paths:
-                warning = ""
-                if self.settings.publish_enabled:
-                    try:
-                        self.github.comment_on_issue(
-                            issue.number,
-                            "Issue-to-PR Agent가 현재 `main`과 검증 결과를 확인했지만 "
-                            "필요한 코드 변경을 찾지 못했습니다. Draft PR은 생성하지 않았습니다.",
-                        )
-                    except GitHubPublishError:
-                        warning = "No-change result was detected, but the issue comment failed."
-                succeeded = True
-                return {
-                    "status": "no-change",
-                    "summary": agent_result.summary,
-                    "warning": warning,
-                    **run_metadata,
-                }
+                raise AgentExecutionError(
+                    "agent produced no verified file changes; "
+                    "refusing a successful no-change result"
+                )
 
             if not self.settings.publish_enabled:
                 succeeded = True

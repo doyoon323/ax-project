@@ -6,8 +6,8 @@
 ## 실행 결과
 
 ```text
-pytest: 55 passed
-branch coverage: 74% (2,234 statements, 726 branches)
+pytest: 56 passed
+branch coverage: 74% (2,233 statements, 730 branches)
 Ruff check/format: passed
 Docker Compose config: passed
 Agent/Runner images: built successfully with hashed Agent dependencies
@@ -29,14 +29,14 @@ docker compose config --quiet
 docker compose build
 ```
 
-## 테스트 55개 분해
+## 테스트 56개 분해
 
 | 영역 | 개수 | 보장하는 내용 |
 |---|---:|---|
-| Agent 제어기 | 12 | 3단계 순서, Schema, fallback, 1회 교정, delivery 누적 비용, fail-to-pass |
+| Agent 제어기 | 12 | 3단계 순서, 빈 Patch 차단, Schema, fallback, 1회 교정, 누적 비용, fail-to-pass |
 | 사전 지역화 | 4 | 정확 일치 순위, Top-5/문맥 제한, AST 선언, 민감 경로·symlink 차단 |
 | Tool·Runner 정책 | 9 | argv/path 허용 목록, 격리 실행, 복잡도 제한, ImportError 재현 거부 |
-| Git·게시 조정 | 4 | mirror/worktree, 승인 파일 push, dry-run, Check 실패 시 PR 차단 |
+| Git·게시 조정 | 5 | 빈 변경 성공 차단, mirror/worktree, 승인 파일 push, dry-run, Check 실패 시 PR 차단 |
 | Webhook·Poller·작업 복구 | 21 | HMAC, 권한, 중복, 누적 원장, 재시도, hard kill, 종료 복구, 상태 표시 |
 | GitHub App 인증 | 5 | JWT·설치 토큰 cache, 신원·저장소·권한 거부, PAT 혼용 차단, Git 인증 환경 |
 
@@ -47,11 +47,11 @@ docker compose build
 | localization | 92% | 파일 선별, AST 선언, 경계·fallback 중심 |
 | jobs | 85% | SQLite 상태 전이, 복구와 누적 사용량 |
 | worker | 82% | 일시/결정적 실패, hard timeout과 종료 복구 |
-| agent | 80% | 3단계 실행, correction, budget, fail-to-pass |
+| agent | 82% | 3단계 실행, 빈 Patch 재요청, correction, budget, fail-to-pass |
 | config | 81% | 주요 운영 제한값 검증 |
 | GitHub App auth | 80% | JWT·설치 토큰, 필수 권한과 저장소 접근 검증 |
-| service | 74% | dry-run, Check 선행과 게시 조정 |
-| tools | 73% | 명령·경로·편집·격리 backend 정책 |
+| service | 89% | 빈 변경 성공 차단, dry-run, Check 선행과 게시 조정 |
+| tools | 72% | 명령·경로·편집·격리 backend 정책 |
 | main | 70% | Webhook 접수·중복 처리 중심 |
 | GitHub client | 60% | 로컬 Git과 REST 요청 생성; 게시 API 전체 E2E는 미검증 |
 | poller | 55% | 단일 scan; 장기 polling loop 장애는 미검증 |
@@ -69,6 +69,7 @@ docker compose build
 | 서비스 종료 중 작업 | 종료 장애 주입 | 프로세스 kill 후 `queued` 복구 |
 | 누적 비용 | SQLite/Agent 단위 테스트 | 재시도 전 사용량을 다음 시도 예산에 포함 |
 | GitHub Check 기록 실패 | Service 단위 테스트 | Draft PR 미생성 |
+| 모델이 변경 없이 완료 주장 | Agent/Service 단위 테스트 | bounded 재요청 후 실패 처리, `no-change` 성공 차단 |
 | 같은 Agent 브랜치 재게시 | 로컬 bare Git 통합 | 기존 원격 SHA를 lease로 갱신 |
 
 ## 아직 증명하지 않은 핵심

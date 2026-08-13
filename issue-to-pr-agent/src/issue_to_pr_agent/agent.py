@@ -152,6 +152,10 @@ class IssueFixAgent:
 
         if final_decision is None or not final_decision.finish:
             raise AgentExecutionError("verify turn did not explicitly finish")
+        if not tools.edited_paths:
+            raise AgentExecutionError(
+                "patch produced no effective file changes; human review is required"
+            )
         self._enforce_change_limits(tools)
 
         correction_cycles = 0
@@ -299,7 +303,11 @@ class IssueFixAgent:
         if phase == "patch":
             for attempt in range(self.settings.llm_retries + 1):
                 try:
+                    if not decision.edits:
+                        raise EditError("patch phase requires at least one file edit")
                     changed = tools.apply_edits(decision.edits)
+                    if not changed:
+                        raise EditError("patch phase produced no effective file changes")
                     break
                 except (EditError, ToolPolicyError) as exc:
                     if attempt >= self.settings.llm_retries:
@@ -312,8 +320,9 @@ class IssueFixAgent:
                                 "content": (
                                     "EDIT CORRECTION REQUIRED: The deterministic editor rejected "
                                     f"the patch because: {exc}. Return a complete patch-phase JSON "
-                                    "object with corrected edits. Use append mode to add content "
-                                    "to an existing file; use exact observed text for replace mode."
+                                    "object with non-empty corrected edits and a regression test. "
+                                    "Use append mode to add content to an existing file; use exact "
+                                    "observed text for replace mode."
                                 ),
                             },
                         ]

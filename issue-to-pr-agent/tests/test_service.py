@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 import issue_to_pr_agent.service as service_module
+from issue_to_pr_agent.agent import AgentExecutionError
 from issue_to_pr_agent.config import Settings
 from issue_to_pr_agent.github_client import GitHubPublishError, PublishResult, WorktreeSession
 from issue_to_pr_agent.models import AgentRunResult, CommandResult, IssueTask
@@ -116,6 +117,25 @@ def test_service_dry_run_never_publishes(monkeypatch: object, tmp_path: Path) ->
     assert result["estimated_cost_usd"] == 0.001
     github.publish_draft_pr.assert_not_called()
     workspaces.commit_and_push.assert_not_called()
+    workspaces.cleanup.assert_called_once()
+
+
+def test_service_rejects_success_without_actual_changes(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    settings = make_settings(tmp_path, publish_enabled=False)
+    service, workspaces, github = build_service(monkeypatch, settings, tmp_path)
+    empty_result = make_result(tmp_path)
+    empty_result.changed_paths = []
+    agent = Mock()
+    agent.run.return_value = empty_result
+    monkeypatch.setattr(service_module, "IssueFixAgent", lambda *_args, **_kwargs: agent)
+
+    with pytest.raises(AgentExecutionError, match="no verified file changes"):
+        service.process(make_issue())
+
+    workspaces.commit_and_push.assert_not_called()
+    github.publish_draft_pr.assert_not_called()
     workspaces.cleanup.assert_called_once()
 
 
